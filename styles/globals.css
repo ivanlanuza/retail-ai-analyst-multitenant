@@ -1,6 +1,6 @@
 @import "tailwindcss";
 @plugin "tailwindcss-animate";
-
+ 
 @custom-variant dark (&:is(.dark *));
 
 :root {
@@ -86,7 +86,7 @@
 }
 
 body {
-  font-family: Arial, Helvetica, sans-serif;
+  @apply font-sans;
 }
 
 .dark {
