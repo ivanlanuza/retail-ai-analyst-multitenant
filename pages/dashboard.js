@@ -31,6 +31,9 @@ export default function DashboardPage({ user }) {
   const [isStatsModalOpen, setIsStatsModalOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [activeAnswer, setActiveAnswer] = useState(null);
+  const [answerMetaByMessageId, setAnswerMetaByMessageId] = useState({});
+  const [activeAnswerMeta, setActiveAnswerMeta] = useState(null);
+  const [showAdvancedStats, setShowAdvancedStats] = useState(false);
 
   const messagesEndRef = useRef(null);
 
@@ -103,6 +106,8 @@ export default function DashboardPage({ user }) {
 
   function handleSelectConversation(id) {
     setSelectedConversationId(id);
+    setAnswerMetaByMessageId({});
+    setActiveAnswerMeta(null);
     fetchMessages(id);
     fetchStats(id);
   }
@@ -112,6 +117,8 @@ export default function DashboardPage({ user }) {
     setMessages([]);
     setQuestion("");
     setStats({ sqlQueries: [], tokenUsage: [] });
+    setAnswerMetaByMessageId({});
+    setActiveAnswerMeta(null);
   }
 
   async function handleAsk(e) {
@@ -138,8 +145,34 @@ export default function DashboardPage({ user }) {
 
       // Update state with returned conversation + messages
       setSelectedConversationId(data.conversationId);
-      setMessages(data.messages || []);
+      const msgs = data.messages || [];
+      setMessages(msgs);
       setQuestion("");
+
+      // Store Phase 1 answer meta for the latest assistant message, keyed by message id
+      if (
+        data &&
+        data.conversationId &&
+        (data.sql || data.table || data.tokens)
+      ) {
+        const latestAssistant = [...msgs]
+          .reverse()
+          .find((m) => m.role === "assistant");
+        if (latestAssistant) {
+          const meta = {
+            conversationId: data.conversationId,
+            sql: data.sql || null,
+            table: data.table || null,
+            tokens: data.tokens || null,
+          };
+          setAnswerMetaByMessageId((prev) => ({
+            ...prev,
+            [latestAssistant.id]: meta,
+          }));
+          // also set as the currently active meta so it's immediately available
+          setActiveAnswerMeta(meta);
+        }
+      }
 
       // Refresh conversations list so updated_at moves to top
       fetchConversations();
@@ -155,6 +188,10 @@ export default function DashboardPage({ user }) {
   function handleOpenStatsForMessage(msg) {
     if (!selectedConversationId) return;
     setActiveAnswer(msg);
+    const meta = answerMetaByMessageId[msg.id];
+    // if we don't have per-message meta yet (e.g., older answers),
+    // keep whatever active meta we already have as a fallback
+    setActiveAnswerMeta((prev) => meta || prev);
     // ensure latest stats for this conversation
     fetchStats(selectedConversationId);
     setIsStatsModalOpen(true);
@@ -163,6 +200,7 @@ export default function DashboardPage({ user }) {
   function handleCloseStatsModal() {
     setIsStatsModalOpen(false);
     setActiveAnswer(null);
+    setShowAdvancedStats(false);
   }
 
   const hasConversations = conversations.length > 0;
@@ -425,118 +463,215 @@ export default function DashboardPage({ user }) {
                 </p>
               ) : (
                 <>
-                  <div>
-                    <div className="mb-1 flex items-center justify-between">
-                      <h3 className="text-xs font-semibold text-neutral-700">
-                        Recent SQL queries
-                      </h3>
-                      {loadingStats && (
-                        <span className="text-[10px] text-neutral-500">
-                          Loading…
-                        </span>
+                  {activeAnswerMeta && (
+                    <div className="space-y-3 rounded-md border border-neutral-100 bg-neutral-50 px-3 py-3">
+                      {activeAnswerMeta.sql && (
+                        <div>
+                          <div className="mb-1 text-[11px] font-semibold text-neutral-700">
+                            SQL for this answer
+                          </div>
+                          <pre className="max-h-32 overflow-auto rounded-md bg-neutral-900 px-3 py-2 font-mono text-[10px] text-neutral-50">
+                            {activeAnswerMeta.sql}
+                          </pre>
+                        </div>
                       )}
+                      {activeAnswerMeta.tokens && (
+                        <div className="text-[11px] text-neutral-700">
+                          Tokens – model{" "}
+                          <span className="font-mono">
+                            {activeAnswerMeta.tokens.model}
+                          </span>
+                          , prompt {activeAnswerMeta.tokens.input}, completion{" "}
+                          {activeAnswerMeta.tokens.output}, total{" "}
+                          {activeAnswerMeta.tokens.total}
+                        </div>
+                      )}
+                      {activeAnswerMeta.table &&
+                        activeAnswerMeta.table.columns &&
+                        activeAnswerMeta.table.rows &&
+                        activeAnswerMeta.table.rows.length > 0 && (
+                          <div>
+                            <div className="mb-1 text-[11px] font-semibold text-neutral-700">
+                              Result preview for this answer (
+                              {activeAnswerMeta.table.rows.length} rows)
+                            </div>
+                            <div className="max-h-40 overflow-auto rounded-md border border-neutral-200 bg-white">
+                              <table className="min-w-full border-collapse text-[11px]">
+                                <thead className="bg-neutral-50">
+                                  <tr>
+                                    {activeAnswerMeta.table.columns.map(
+                                      (col) => (
+                                        <th
+                                          key={col}
+                                          className="px-2 py-1 text-left font-medium text-neutral-700"
+                                        >
+                                          {col}
+                                        </th>
+                                      )
+                                    )}
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {activeAnswerMeta.table.rows.map(
+                                    (row, idx) => (
+                                      <tr
+                                        key={idx}
+                                        className={
+                                          idx % 2 === 0
+                                            ? "bg-white"
+                                            : "bg-neutral-50"
+                                        }
+                                      >
+                                        {activeAnswerMeta.table.columns.map(
+                                          (col) => (
+                                            <td
+                                              key={col}
+                                              className="px-2 py-1 whitespace-nowrap font-mono text-[10px] text-neutral-800"
+                                            >
+                                              {row[col]}
+                                            </td>
+                                          )
+                                        )}
+                                      </tr>
+                                    )
+                                  )}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
                     </div>
-                    {!loadingStats && stats.sqlQueries.length === 0 && (
-                      <p className="text-neutral-500">
-                        No SQL queries recorded yet.
-                      </p>
-                    )}
-                    {!loadingStats && stats.sqlQueries.length > 0 && (
-                      <div className="max-h-40 overflow-y-auto rounded-md border border-neutral-100">
-                        <table className="w-full border-collapse text-[11px]">
-                          <thead className="bg-neutral-50 text-neutral-500">
-                            <tr>
-                              <th className="px-2 py-1 text-left font-medium">
-                                SQL
-                              </th>
-                              <th className="px-2 py-1 text-left font-medium">
-                                Status
-                              </th>
-                              <th className="px-2 py-1 text-right font-medium">
-                                Rows
-                              </th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {stats.sqlQueries.map((q) => (
-                              <tr
-                                key={q.id}
-                                className="border-t border-neutral-100"
-                              >
-                                <td className="px-2 py-1 align-top">
-                                  <span className="line-clamp-2 font-mono text-[10px]">
-                                    {q.sql_text}
-                                  </span>
-                                </td>
-                                <td className="px-2 py-1 align-top text-neutral-700">
-                                  {q.status}
-                                </td>
-                                <td className="px-2 py-1 align-top text-right text-neutral-700">
-                                  {q.rows_returned ?? "—"}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
+                  )}
+
+                  {/* More info toggle */}
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => setShowAdvancedStats((prev) => !prev)}
+                      className="text-[11px] font-medium text-neutral-600 underline-offset-2 hover:underline"
+                    >
+                      {showAdvancedStats ? "Hide more info" : "More info"}
+                    </button>
                   </div>
 
-                  <div>
-                    <div className="mb-1 flex items-center justify-between">
-                      <h3 className="text-xs font-semibold text-neutral-700">
-                        Recent token usage
-                      </h3>
-                    </div>
-                    {!loadingStats && stats.tokenUsage.length === 0 && (
-                      <p className="text-neutral-500">
-                        No token usage recorded yet.
-                      </p>
-                    )}
-                    {!loadingStats && stats.tokenUsage.length > 0 && (
-                      <div className="max-h-40 overflow-y-auto rounded-md border border-neutral-100">
-                        <table className="w-full border-collapse text-[11px]">
-                          <thead className="bg-neutral-50 text-neutral-500">
-                            <tr>
-                              <th className="px-2 py-1 text-left font-medium">
-                                Model
-                              </th>
-                              <th className="px-2 py-1 text-right font-medium">
-                                Prompt
-                              </th>
-                              <th className="px-2 py-1 text-right font-medium">
-                                Completion
-                              </th>
-                              <th className="px-2 py-1 text-right font-medium">
-                                Total
-                              </th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {stats.tokenUsage.map((t) => (
-                              <tr
-                                key={t.id}
-                                className="border-t border-neutral-100"
-                              >
-                                <td className="px-2 py-1 align-top text-neutral-700">
-                                  {t.model || "—"}
-                                </td>
-                                <td className="px-2 py-1 align-top text-right text-neutral-700">
-                                  {t.prompt_tokens ?? "—"}
-                                </td>
-                                <td className="px-2 py-1 align-top text-right text-neutral-700">
-                                  {t.completion_tokens ?? "—"}
-                                </td>
-                                <td className="px-2 py-1 align-top text-right text-neutral-700">
-                                  {t.total_tokens ?? "—"}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
+                  {showAdvancedStats && (
+                    <>
+                      {/* Recent SQL queries */}
+                      <div>
+                        <div className="mb-1 flex items-center justify-between">
+                          <h3 className="text-xs font-semibold text-neutral-700">
+                            Recent SQL queries
+                          </h3>
+                          {loadingStats && (
+                            <span className="text-[10px] text-neutral-500">
+                              Loading…
+                            </span>
+                          )}
+                        </div>
+                        {!loadingStats && stats.sqlQueries.length === 0 && (
+                          <p className="text-neutral-500">
+                            No SQL queries recorded yet.
+                          </p>
+                        )}
+                        {!loadingStats && stats.sqlQueries.length > 0 && (
+                          <div className="max-h-40 overflow-y-auto rounded-md border border-neutral-100">
+                            <table className="w-full border-collapse text-[11px]">
+                              <thead className="bg-neutral-50 text-neutral-500">
+                                <tr>
+                                  <th className="px-2 py-1 text-left font-medium">
+                                    SQL
+                                  </th>
+                                  <th className="px-2 py-1 text-left font-medium">
+                                    Status
+                                  </th>
+                                  <th className="px-2 py-1 text-right font-medium">
+                                    Rows
+                                  </th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {stats.sqlQueries.map((q) => (
+                                  <tr
+                                    key={q.id}
+                                    className="border-t border-neutral-100"
+                                  >
+                                    <td className="px-2 py-1 align-top">
+                                      <span className="line-clamp-2 font-mono text-[10px]">
+                                        {q.sql_text}
+                                      </span>
+                                    </td>
+                                    <td className="px-2 py-1 align-top text-neutral-700">
+                                      {q.status}
+                                    </td>
+                                    <td className="px-2 py-1 align-top text-right text-neutral-700">
+                                      {q.rows_returned ?? "—"}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
                       </div>
-                    )}
-                  </div>
+
+                      {/* Recent token usage */}
+                      <div>
+                        <div className="mb-1 flex items-center justify-between">
+                          <h3 className="text-xs font-semibold text-neutral-700">
+                            Recent token usage
+                          </h3>
+                        </div>
+                        {!loadingStats && stats.tokenUsage.length === 0 && (
+                          <p className="text-neutral-500">
+                            No token usage recorded yet.
+                          </p>
+                        )}
+                        {!loadingStats && stats.tokenUsage.length > 0 && (
+                          <div className="max-h-40 overflow-y-auto rounded-md border border-neutral-100">
+                            <table className="w-full border-collapse text-[11px]">
+                              <thead className="bg-neutral-50 text-neutral-500">
+                                <tr>
+                                  <th className="px-2 py-1 text-left font-medium">
+                                    Model
+                                  </th>
+                                  <th className="px-2 py-1 text-right font-medium">
+                                    Prompt
+                                  </th>
+                                  <th className="px-2 py-1 text-right font-medium">
+                                    Completion
+                                  </th>
+                                  <th className="px-2 py-1 text-right font-medium">
+                                    Total
+                                  </th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {stats.tokenUsage.map((t) => (
+                                  <tr
+                                    key={t.id}
+                                    className="border-t border-neutral-100"
+                                  >
+                                    <td className="px-2 py-1 align-top text-neutral-700">
+                                      {t.model || "—"}
+                                    </td>
+                                    <td className="px-2 py-1 align-top text-right text-neutral-700">
+                                      {t.prompt_tokens ?? "—"}
+                                    </td>
+                                    <td className="px-2 py-1 align-top text-right text-neutral-700">
+                                      {t.completion_tokens ?? "—"}
+                                    </td>
+                                    <td className="px-2 py-1 align-top text-right text-neutral-700">
+                                      {t.total_tokens ?? "—"}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
                 </>
               )}
             </div>
