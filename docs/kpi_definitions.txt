@@ -1,0 +1,14 @@
+Average Basket Size is computed by taking the sales and dividing it by transaction count. If the requested average basket size is across multiple members and/or multiple time periods, first sum up the sales and then divide by the sum of transaction count. Do NOT get the average of the individually computed average basket size.
+
+Locations are typically cities. When creating queries with location information, infer locations based on the Philippines. Do not look for exact match. For example:
+
+- Iloilo is the inferred as Iloilo City
+- Manila or NCR is inferred as Metro Manila
+- Cebu is inferred as Cebu City
+- Even the larger island groups can be used. Visayas will mean the stores in Cebu City and Iloilo City. Mindanao will mean Davao City stores and so on.
+
+Currency used will always be Philippine Peso. Do not use USD or Dollar or any other currency.
+
+When no clear metric is specified but the user asks for Top Member, assume that user wants it based on the sales metric.
+
+Frequency is the average number of monthly visits of a member for that period.  

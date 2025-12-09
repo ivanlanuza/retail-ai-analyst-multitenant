@@ -30,10 +30,20 @@ export default function DashboardPage({ user }) {
   const [loadingStats, setLoadingStats] = useState(false);
   const [isStatsModalOpen, setIsStatsModalOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [isUsageModalOpen, setIsUsageModalOpen] = useState(false);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageSummary, setUsageSummary] = useState({
+    lifetimeTotalTokens: 0,
+    monthTotalTokens: 0,
+    weekTotalTokens: 0,
+    daily: [],
+  });
   const [activeAnswer, setActiveAnswer] = useState(null);
   const [answerMetaByMessageId, setAnswerMetaByMessageId] = useState({});
   const [activeAnswerMeta, setActiveAnswerMeta] = useState(null);
   const [showAdvancedStats, setShowAdvancedStats] = useState(false);
+  const [useRag, setUseRag] = useState(true);
 
   const messagesEndRef = useRef(null);
 
@@ -104,6 +114,70 @@ export default function DashboardPage({ user }) {
     }
   }
 
+  async function openUsageStats() {
+    setIsSettingsOpen(false);
+    setIsUsageModalOpen(true);
+    setUsageLoading(true);
+
+    try {
+      const res = await fetch("/api/chat/usage");
+      const data = await res.json();
+      console.log("Usage data:", data);
+      if (!res.ok) {
+        console.error(data.error || "Failed to load usage stats");
+        return;
+      }
+
+      const summary = data.summary || {};
+
+      const lifetime =
+        data.lifetimeTotalTokens ??
+        summary.lifetime_total ??
+        summary.lifetimeTokens ??
+        0;
+      const month =
+        data.monthTotalTokens ??
+        summary.month_total ??
+        summary.monthTokens ??
+        0;
+      const week =
+        data.weekTotalTokens ?? summary.week_total ?? summary.weekTokens ?? 0;
+
+      const dailyArray = Array.isArray(data.daily) ? data.daily : [];
+
+      setUsageSummary({
+        lifetimeTotalTokens: Number(lifetime) || 0,
+        monthTotalTokens: Number(month) || 0,
+        weekTotalTokens: Number(week) || 0,
+        daily: dailyArray.map((d) => {
+          const rawDate = d.date;
+          const dateStr =
+            typeof rawDate === "string"
+              ? rawDate
+              : rawDate instanceof Date
+              ? rawDate.toISOString().slice(0, 10)
+              : new Date(rawDate).toISOString().slice(0, 10);
+
+          const value =
+            d.totalTokens ??
+            d.total_tokens ??
+            d.total ??
+            d.total_tokens_sum ??
+            0;
+
+          return {
+            date: dateStr,
+            totalTokens: Number(value) || 0,
+          };
+        }),
+      });
+    } catch (err) {
+      console.error("Error loading usage stats:", err);
+    } finally {
+      setUsageLoading(false);
+    }
+  }
+
   function handleSelectConversation(id) {
     setSelectedConversationId(id);
     setAnswerMetaByMessageId({});
@@ -119,6 +193,7 @@ export default function DashboardPage({ user }) {
     setStats({ sqlQueries: [], tokenUsage: [] });
     setAnswerMetaByMessageId({});
     setActiveAnswerMeta(null);
+    setUseRag(true);
   }
 
   async function handleAsk(e) {
@@ -133,6 +208,7 @@ export default function DashboardPage({ user }) {
         body: JSON.stringify({
           conversationId: selectedConversationId,
           question: question.trim(),
+          useRag,
         }),
       });
 
@@ -164,6 +240,7 @@ export default function DashboardPage({ user }) {
             sql: data.sql || null,
             table: data.table || null,
             tokens: data.tokens || null,
+            rag: data.rag || null,
           };
           setAnswerMetaByMessageId((prev) => ({
             ...prev,
@@ -207,10 +284,10 @@ export default function DashboardPage({ user }) {
   const isChatStarted = !!selectedConversationId && messages.length > 0;
   return (
     <div
-      className={`${geistSans.className} ${geistMono.className} flex min-h-screen bg-neutral-100 font-sans dark:bg-black`}
+      className={`${geistSans.className} ${geistMono.className} flex h-screen bg-neutral-100 font-sans dark:bg-black`}
     >
       {/* Sidebar */}
-      <aside className="flex w-72 flex-col border-r border-neutral-200 bg-white">
+      <aside className="flex h-screen w-72 flex-col border-r border-neutral-200 bg-white">
         <div className="border-b border-neutral-200 px-4 py-4 flex items-center justify-between">
           <div>
             <h1 className="text-sm font-semibold text-neutral-900">
@@ -295,14 +372,17 @@ export default function DashboardPage({ user }) {
                 <button
                   type="button"
                   className="block w-full px-3 py-2 text-left text-neutral-700 hover:bg-neutral-100"
-                  onClick={() => setIsSettingsOpen(false)}
+                  onClick={() => {
+                    setIsSettingsOpen(false);
+                    setIsSettingsModalOpen(true);
+                  }}
                 >
                   Settings
                 </button>
                 <button
                   type="button"
                   className="block w-full px-3 py-2 text-left text-neutral-700 hover:bg-neutral-100"
-                  onClick={() => setIsSettingsOpen(false)}
+                  onClick={openUsageStats}
                 >
                   Usage stats
                 </button>
@@ -321,7 +401,7 @@ export default function DashboardPage({ user }) {
       </aside>
 
       {/* Main content */}
-      <main className="flex flex-1 flex-col pl-4 pr-8 py-4">
+      <main className="flex flex-1 flex-col pl-4 pr-8 py-4 overflow-hidden">
         {isChatStarted ? (
           <section className="flex flex-1 flex-col gap-3">
             {/* Chat area */}
@@ -430,6 +510,177 @@ export default function DashboardPage({ user }) {
         )}
       </main>
 
+      {/* Settings modal */}
+      {isSettingsModalOpen && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40">
+          <div className="w-full max-w-md rounded-lg border border-neutral-200 bg-white shadow-lg">
+            <div className="flex items-center justify-between border-b border-neutral-100 px-4 py-3">
+              <h2 className="text-sm font-medium text-neutral-900">Settings</h2>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="border-neutral-300 text-neutral-700 hover:bg-neutral-100"
+                onClick={() => setIsSettingsModalOpen(false)}
+              >
+                Close
+              </Button>
+            </div>
+            <div className="space-y-4 px-4 py-4 text-xs">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-[11px] font-semibold text-neutral-800">
+                    Use business context (RAG)
+                  </div>
+                  <div className="text-[11px] text-neutral-600">
+                    When enabled, your questions are enriched with schema and
+                    business documentation from the vector database.
+                  </div>
+                </div>
+                <label className="ml-4 inline-flex items-center gap-2 text-[11px] text-neutral-700">
+                  <input
+                    type="checkbox"
+                    className="h-3 w-3"
+                    checked={useRag}
+                    onChange={(e) => setUseRag(e.target.checked)}
+                  />
+                  <span>Enabled</span>
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Usage stats modal */}
+      {isUsageModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="w-full max-w-3xl rounded-lg border border-neutral-200 bg-white shadow-lg">
+            <div className="flex items-center justify-between border-b border-neutral-100 px-4 py-3">
+              <h2 className="text-sm font-medium text-neutral-900">
+                Usage statistics
+              </h2>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="border-neutral-300 text-neutral-700 hover:bg-neutral-100"
+                onClick={() => setIsUsageModalOpen(false)}
+              >
+                Close
+              </Button>
+            </div>
+            <div className="space-y-4 px-4 py-4 text-xs">
+              {usageLoading ? (
+                <p className="text-neutral-500">Loading usage stats…</p>
+              ) : (
+                <>
+                  {/* Summary widgets */}
+                  <div className="grid gap-3 md:grid-cols-3">
+                    <div className="rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3">
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+                        Lifetime tokens
+                      </div>
+                      <div className="mt-1 text-lg font-semibold text-neutral-900">
+                        {usageSummary.lifetimeTotalTokens.toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3">
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+                        This month
+                      </div>
+                      <div className="mt-1 text-lg font-semibold text-neutral-900">
+                        {usageSummary.monthTotalTokens.toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3">
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+                        This week
+                      </div>
+                      <div className="mt-1 text-lg font-semibold text-neutral-900">
+                        {usageSummary.weekTotalTokens.toLocaleString()}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Daily chart (simple bar chart) */}
+                  <div>
+                    <div className="mb-1 text-[11px] font-semibold text-neutral-700">
+                      Daily token usage (last 30 days)
+                    </div>
+                    {usageSummary.daily.length === 0 ? (
+                      <p className="text-[11px] text-neutral-500">
+                        No usage recorded yet.
+                      </p>
+                    ) : (
+                      <>
+                        <div className="flex h-32 items-end gap-[2px] rounded-md border border-neutral-200 bg-neutral-50 px-2 py-2">
+                          {(() => {
+                            // usageSummary.daily is already normalized in openUsageStats
+                            // to have { date: string, totalTokens: number }.
+                            if (!Array.isArray(usageSummary.daily)) return null;
+
+                            const values = usageSummary.daily.map((d) =>
+                              typeof d.totalTokens === "number"
+                                ? d.totalTokens
+                                : Number(d.totalTokens) || 0
+                            );
+
+                            const max = values.reduce(
+                              (acc, v) => (v > acc ? v : acc),
+                              0
+                            );
+
+                            const safeMax = max || 1; // avoid division by zero
+
+                            return usageSummary.daily.map((d, idx) => {
+                              const rawValue = d.totalTokens;
+                              const value =
+                                typeof rawValue === "number"
+                                  ? rawValue
+                                  : Number(rawValue) || 0;
+                              const heightPct = Math.max(
+                                2,
+                                (value / safeMax) * 100
+                              );
+
+                              return (
+                                <div
+                                  key={`${d.date}-${idx}`}
+                                  className="group flex-1"
+                                  title={`${d.date}: ${value} tokens`}
+                                >
+                                  <div
+                                    className="w-full rounded-t-sm bg-neutral-400 transition-colors group-hover:bg-neutral-700"
+                                    style={{
+                                      height: `${heightPct}%`,
+                                    }}
+                                  />
+                                </div>
+                              );
+                            });
+                          })()}
+                        </div>
+                        <div className="mt-1 flex justify-between text-[9px] text-neutral-500">
+                          <span>
+                            {usageSummary.daily[0].date} –{" "}
+                            {
+                              usageSummary.daily[usageSummary.daily.length - 1]
+                                .date
+                            }
+                          </span>
+                          <span>Total tokens per day</span>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Stats modal */}
       {isStatsModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
@@ -486,6 +737,46 @@ export default function DashboardPage({ user }) {
                           {activeAnswerMeta.tokens.total}
                         </div>
                       )}
+                      {activeAnswerMeta.rag &&
+                        activeAnswerMeta.rag.used &&
+                        activeAnswerMeta.rag.sources &&
+                        activeAnswerMeta.rag.sources.length > 0 && (
+                          <div className="mt-2 space-y-1">
+                            <div className="text-[11px] font-semibold text-neutral-700">
+                              Source materials used for this answer (
+                              {activeAnswerMeta.rag.sources.length})
+                            </div>
+                            <div className="max-h-32 space-y-1 overflow-auto rounded-md border border-neutral-200 bg-white px-2 py-2">
+                              {activeAnswerMeta.rag.sources.map((src) => (
+                                <div
+                                  key={src.id}
+                                  className="border-b border-neutral-100 pb-1 last:border-b-0 last:pb-0"
+                                >
+                                  <div className="text-[11px] font-medium text-neutral-800">
+                                    {src.title}
+                                  </div>
+                                  <div className="text-[10px] text-neutral-600">
+                                    {src.type && <span>{src.type}</span>}
+                                    {src.table_name && (
+                                      <span>
+                                        {" "}
+                                        · table: <code>{src.table_name}</code>
+                                      </span>
+                                    )}
+                                    {src.page != null && (
+                                      <span> · page {src.page}</span>
+                                    )}
+                                  </div>
+                                  {src.snippet && (
+                                    <div className="mt-0.5 line-clamp-2 text-[10px] text-neutral-700">
+                                      {src.snippet}
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       {activeAnswerMeta.table &&
                         activeAnswerMeta.table.columns &&
                         activeAnswerMeta.table.rows &&
