@@ -1,10 +1,10 @@
 // pages/api/chat/ask.js
-import { query, queryWithFields } from "../../../lib/db";
+import { query, queryWithFields } from "../../../lib/db.mjs";
 import { getUserFromRequest } from "../../../lib/auth";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 import { getSchemaText } from "../../../lib/sqlDb";
-import { getVectorStore } from "../../../lib/qdrantStore"; // <-- NEW (RAG)
+import { getVectorStore } from "../../../lib/qdrantStore"; // <-- RAG
 
 const MODEL_NAME = "gpt-4o-mini";
 
@@ -12,6 +12,9 @@ const llm = new ChatOpenAI({
   model: MODEL_NAME,
   temperature: 0,
 });
+
+const SUMMARY_MESSAGE_INTERVAL = 12; // summarize every 12 messages
+const MIN_MESSAGES_FOR_SUMMARY = 6; // minimum before summarizing
 
 /**
  * Safely convert ChatOpenAI message content to a string
@@ -27,6 +30,223 @@ function contentToString(content) {
     return content.text;
   }
   return String(content ?? "");
+}
+
+/**
+ * Classify whether the user is asking for data (something that should hit the DB)
+ * vs. a general/non-data request.
+ * Returns true if it's likely a data question, false otherwise.
+ */
+async function isDataQuestion(question) {
+  const classifyPrompt = ChatPromptTemplate.fromMessages([
+    [
+      "system",
+      [
+        "You are a classifier in a retail analytics assistant.",
+        "Your job is to decide if the user is asking for DATA from the database",
+        "(for example: metrics, counts, lists, breakdowns, comparisons, trends, or reports)",
+        "or if they are instead asking for something else (like how the system works, general advice, or small talk).",
+        "",
+        "If the question requires querying or calculating from stored business data, answer exactly: YES",
+        "If not, answer exactly: NO",
+        "",
+        "Do not add any other words.",
+      ].join(" "),
+    ],
+    ["human", "User question:\n{question}\n\nAnswer with only YES or NO."],
+  ]);
+
+  const messages = await classifyPrompt.formatMessages({ question });
+  const resp = await llm.invoke(messages);
+  const text = contentToString(resp.content).trim().toUpperCase();
+  if (text.startsWith("YES")) return true;
+  if (text.startsWith("NO")) return false;
+  // Fallback: be permissive and treat as data question so we don't block valid use
+  return true;
+}
+
+/**
+ * Build a friendly, contextual response for non-data questions.
+ * It should acknowledge what the user said, but gently steer them
+ * toward asking a data / analytics question instead.
+ */
+async function buildNonDataResponse(question) {
+  const prompt = ChatPromptTemplate.fromMessages([
+    [
+      "system",
+      [
+        "You are the assistant for a retail analytics tool that answers questions by querying business data (via SQL).",
+        "Sometimes users send messages that are not actually data questions (e.g., small talk, how-the-system-works questions, meta questions, or vague comments).",
+        "",
+        "Your job is to:",
+        "- Respond in a friendly, concise way (1–3 sentences).",
+        "- Acknowledge the content or intent of the user's message.",
+        "- Clearly but gently remind them that this assistant is best used for questions about their data (metrics, reports, comparisons, trends, etc.).",
+        "- Invite them to ask a concrete data question (you can give 1–2 example phrasings).",
+        "",
+        "Do NOT generate or mention any SQL in your reply.",
+        "Do NOT say you cannot answer; instead, explain how they can get value by asking about their data.",
+      ].join(" "),
+    ],
+    [
+      "human",
+      "Here is the user's latest message:\n\n{question}\n\nWrite your friendly reply now.",
+    ],
+  ]);
+
+  const messages = await prompt.formatMessages({ question });
+  const resp = await llm.invoke(messages);
+  const text = contentToString(resp.content).trim();
+  if (!text) {
+    // Fallback static text if the LLM somehow returns empty content
+    return (
+      'Got it. This assistant is wired to answer questions by querying your data (for example: "Show me sales by store for last month" or "Compare loyalty signups by branch"). ' +
+      "If you’d like, ask what you want to see in the data and I’ll run the query for you."
+    );
+  }
+  return text;
+}
+
+/**
+ * Extract the last N question/answer pairs from a chronological message list.
+ * A pair is user (question) followed by assistant (answer).
+ */
+function extractLastQAPairs(messages, maxPairs = 2) {
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+
+  // messages are expected to be in chronological order
+  const pairs = [];
+  let currentPair = null;
+
+  for (const m of messages) {
+    if (m.role === "user") {
+      // start a new pair for each user message
+      currentPair = { question: m.content || "", answer: null };
+      pairs.push(currentPair);
+      // keep only the last maxPairs
+      if (pairs.length > maxPairs) {
+        pairs.shift();
+      }
+    } else if (m.role === "assistant") {
+      // attach assistant reply to the most recent pair without an answer
+      if (pairs.length > 0) {
+        const last = pairs[pairs.length - 1];
+        if (last && !last.answer) {
+          last.answer = m.content || "";
+        }
+      }
+    }
+  }
+
+  return pairs;
+}
+
+/**
+ * Format recent Q&A pairs into a short context string for the LLM.
+ */
+function formatRecentQAPairsForContext(pairs) {
+  if (!Array.isArray(pairs) || pairs.length === 0) return "";
+
+  return pairs
+    .map((p, idx) => {
+      const n = idx + 1;
+      const q = (p.question || "").trim();
+      const a = (p.answer || "").trim();
+      const lines = [];
+      if (q) lines.push(`Q${n}: ${q}`);
+      if (a) lines.push(`A${n}: ${a}`);
+      return lines.join("\n");
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/**
+ * Format messages into a plain-text transcript for summarization.
+ */
+function formatMessagesForSummary(messages) {
+  return messages
+    .map((m) => {
+      const role = m.role ? m.role.toUpperCase() : "UNKNOWN";
+      return `${role}: ${m.content}`;
+    })
+    .join("\n\n");
+}
+
+/**
+ * Maybe update the conversation_summary for a conversation.
+ * - Only runs when messageCount >= MIN_MESSAGES_FOR_SUMMARY
+ *   AND messageCount % SUMMARY_MESSAGE_INTERVAL === 0
+ */
+async function maybeUpdateConversationSummary(
+  convId,
+  messages,
+  existingSummary = ""
+) {
+  const messageCount = Array.isArray(messages) ? messages.length : 0;
+
+  if (
+    messageCount < MIN_MESSAGES_FOR_SUMMARY ||
+    messageCount % SUMMARY_MESSAGE_INTERVAL !== 0
+  ) {
+    return null;
+  }
+
+  const transcript = formatMessagesForSummary(messages);
+
+  const summaryPrompt = ChatPromptTemplate.fromMessages([
+    [
+      "system",
+      [
+        "You maintain a running summary of a conversation between a retail executive and a data assistant.",
+        "You are given the existing summary (which may be empty) and the full transcript of messages.",
+        "Update the summary to capture the main goals, questions, decisions, constraints, and user preferences.",
+        "Keep the summary concise (max 300 words) and focused on information that will be useful for future questions.",
+        "Return only the updated summary text.",
+      ].join(" "),
+    ],
+    [
+      "human",
+      [
+        "Existing summary (may be empty):",
+        "{existingSummary}",
+        "",
+        "Full conversation transcript:",
+        "{transcript}",
+        "",
+        "Write an updated summary now.",
+      ].join("\n"),
+    ],
+  ]);
+
+  const summaryMessages = await summaryPrompt.formatMessages({
+    existingSummary: existingSummary || "",
+    transcript,
+  });
+
+  const summaryMsg = await llm.invoke(summaryMessages);
+  const updatedSummary = contentToString(summaryMsg.content).trim();
+
+  if (!updatedSummary) return null;
+
+  await query(
+    "UPDATE conversations SET conversation_summary = ?, summary_updated_at = NOW() WHERE id = ?",
+    [updatedSummary, convId]
+  );
+
+  return updatedSummary;
+}
+
+/**
+ * Fetch the latest long-term memory summary for a user, if any.
+ */
+async function getUserLongTermMemorySummary(userId) {
+  const rows = await query(
+    "SELECT memory_summary FROM user_long_term_memory WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
+    [userId]
+  );
+  if (!rows || rows.length === 0) return "";
+  return rows[0].memory_summary || "";
 }
 
 /**
@@ -87,6 +307,109 @@ export default async function handler(req, res) {
     );
     const userMessageId = userMsgResult.insertId;
 
+    // 2.0) Quick classification: is this a data question?
+    let isDataRequest = true;
+    try {
+      isDataRequest = await isDataQuestion(question);
+    } catch (classErr) {
+      console.error("Error classifying question as data/non-data:", classErr);
+      // default: treat as data question so we don't block valid flows
+      isDataRequest = true;
+    }
+
+    if (!isDataRequest) {
+      let acknowledgment;
+      try {
+        acknowledgment = await buildNonDataResponse(question);
+      } catch (ndErr) {
+        console.error("Error building non-data response:", ndErr);
+        acknowledgment =
+          'Got it. This assistant is wired to answer questions by querying your data (for example: "Show me sales by store for last month" or "Compare loyalty signups by branch"). ' +
+          "If you’d like, ask what you want to see in the data and I’ll run the query for you.";
+      }
+
+      // Store assistant message so the conversation thread stays consistent
+      const assistantMsgResult = await query(
+        "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
+        [convId, null, "assistant", acknowledgment]
+      );
+      const assistantMessageId = assistantMsgResult.insertId;
+
+      // Optionally log token usage as zeroed for this non-data turn
+      await query(
+        `INSERT INTO token_usage
+         (conversation_id, message_id, user_id, model, prompt_tokens, completion_tokens, total_tokens)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [convId, assistantMessageId, user.id, MODEL_NAME, 0, 0, 0]
+      );
+
+      const messages = await query(
+        "SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
+        [convId]
+      );
+
+      return res.status(200).json({
+        conversationId: convId,
+        messages,
+        status: "non_data",
+        answer: acknowledgment,
+        sql: null,
+        table: {
+          columns: [],
+          rows: [],
+        },
+        tokens: {
+          model: MODEL_NAME,
+          input: 0,
+          output: 0,
+          total: 0,
+        },
+        sqlQueryId: null,
+        rag: {
+          requested: false,
+          used: false,
+          error: null,
+          sourceCount: 0,
+          sources: [],
+        },
+      });
+    }
+
+    // 2.1) Fetch existing conversation summary + user long-term memory for this request
+    let conversationSummaryForPrompt = "";
+    try {
+      const convRows = await query(
+        "SELECT conversation_summary FROM conversations WHERE id = ?",
+        [convId]
+      );
+      if (convRows.length > 0) {
+        conversationSummaryForPrompt = convRows[0].conversation_summary || "";
+      }
+    } catch (csErr) {
+      console.error("Error fetching conversation summary:", csErr);
+    }
+
+    const userMemorySummary = await getUserLongTermMemorySummary(user.id);
+
+    // 2.2) Compute recent Q&A pairs (before this question) for extra context
+    let recentQAPairsText = "";
+    try {
+      const priorMessages = await query(
+        "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
+        [convId]
+      );
+
+      // Remove the last message (the current question we just inserted)
+      if (priorMessages.length > 0) {
+        priorMessages.pop();
+      }
+
+      const qaPairs = extractLastQAPairs(priorMessages, 2);
+      recentQAPairsText = formatRecentQAPairsForContext(qaPairs);
+    } catch (qaErr) {
+      console.error("Error building recent Q&A context:", qaErr);
+    }
+
     // 3) RAG: retrieve context from vector DB (optional)
     let retrievedDocs = [];
     let ragError = null;
@@ -102,7 +425,7 @@ export default async function handler(req, res) {
       }
     }
 
-    const ragContext = retrievedDocs
+    const ragSourcesText = retrievedDocs
       .map((d, idx) => {
         const meta = d.metadata || {};
         const labelParts = [];
@@ -123,14 +446,48 @@ export default async function handler(req, res) {
       })
       .join("\n\n");
 
-    // 4) Build NL -> SQL prompt using schema introspection + RAG context
+    // Build a combined "context" string that includes:
+    // - User long-term memory
+    // - Conversation summary
+    // - RAG knowledge base snippets
+    const contextParts = [];
+
+    if (recentQAPairsText) {
+      contextParts.push(
+        "Most recent questions and answers (before the current question):\n" +
+          recentQAPairsText
+      );
+    }
+
+    if (userMemorySummary) {
+      contextParts.push(
+        "User long-term memory / preferences:\n" + userMemorySummary
+      );
+    }
+
+    if (conversationSummaryForPrompt) {
+      contextParts.push(
+        "Conversation summary so far:\n" + conversationSummaryForPrompt
+      );
+    }
+
+    if (ragSourcesText) {
+      contextParts.push("Knowledge base sources:\n" + ragSourcesText);
+    }
+
+    const ragContext =
+      contextParts.length > 0
+        ? contextParts.join("\n\n---\n\n")
+        : "(No additional RAG or memory context available.)";
+
+    // 4) Build NL -> SQL prompt using schema introspection + memory + RAG context
     const schemaText = await getSchemaText();
 
     const sqlPrompt = ChatPromptTemplate.fromMessages([
       [
         "system",
         [
-          "You are a SQL assistant for a MySQL 8 database that stores loyalty metrics.",
+          "You are a SQL assistant for a MySQL 8 database that stores loyalty and retail metrics.",
           "You can ONLY generate a single SQL SELECT query.",
           "Never modify data (no INSERT, UPDATE, DELETE, DROP, CREATE, ALTER).",
           "All amounts are in Philippine Pesos (PHP).",
@@ -140,10 +497,14 @@ export default async function handler(req, res) {
           "You have the following database schema:",
           "{schema}",
           "",
-          "You may also have additional business and schema context retrieved from a vector database:",
+          "You also have additional context that may include:",
+          "- User long-term preferences and environment.",
+          "- A running summary of this conversation.",
+          "- Knowledge base snippets from documentation or schema notes.",
+          "",
           "{context}",
           "",
-          "Use the context when it's relevant to interpret ambiguous column names, business terms, or KPIs,",
+          "Use this context when it's relevant to interpret ambiguous column names, business terms, KPIs, or user intent,",
           "but do NOT invent tables or columns that are not present in the actual schema.",
           "",
           "Return ONLY the SQL query, nothing else.",
@@ -157,7 +518,7 @@ export default async function handler(req, res) {
 
     const sqlMessages = await sqlPrompt.formatMessages({
       schema: schemaText,
-      context: ragContext || "(No additional RAG context available.)",
+      context: ragContext,
       question,
     });
 
@@ -216,7 +577,7 @@ export default async function handler(req, res) {
     const sqlQueryId = sqlQueryResult.insertId;
 
     if (executionError) {
-      // For Phase 1/2: return SQL + error so you can debug prompt/chain
+      // For Phase 1/2/3: return SQL + error so you can debug prompt/chain
       return res.status(400).json({
         error: "SQL_EXECUTION_ERROR",
         message: errorMessage,
@@ -240,6 +601,7 @@ export default async function handler(req, res) {
           "You are a data analyst.",
           "Given the user's question, the SQL query that was run, and the resulting rows,",
           "produce a short, clear answer (1–3 sentences) in plain English.",
+          "For currency figures, always use Philippine Peso (₱).",
         ].join(" "),
       ],
       [
@@ -380,6 +742,17 @@ export default async function handler(req, res) {
       "SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
       [convId]
     );
+
+    // 11.1) Maybe update conversation summary (for future turns)
+    try {
+      await maybeUpdateConversationSummary(
+        convId,
+        messages,
+        conversationSummaryForPrompt
+      );
+    } catch (summaryErr) {
+      console.error("Error updating conversation summary:", summaryErr);
+    }
 
     const columns = fields.map((f) => f.name);
 

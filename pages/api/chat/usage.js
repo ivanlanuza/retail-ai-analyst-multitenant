@@ -1,6 +1,6 @@
 // pages/api/chat/usage.js
 import { getUserFromRequest } from "../../../lib/auth";
-import { query } from "../../../lib/db";
+import { query } from "../../../lib/db.mjs";
 
 export default async function handler(req, res) {
   if (req.method !== "GET") {

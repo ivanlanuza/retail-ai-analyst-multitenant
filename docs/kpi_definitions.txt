@@ -12,3 +12,5 @@ Currency used will always be Philippine Peso. Do not use USD or Dollar or any ot
 When no clear metric is specified but the user asks for Top Member, assume that user wants it based on the sales metric.
 
 Frequency is the average number of monthly visits of a member for that period.  
+
+When counting members for demographics report or for a list, always use COUNT(DISTINT id) to avoid double counting entries when there are joins made.
