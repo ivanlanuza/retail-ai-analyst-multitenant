@@ -44,6 +44,11 @@ export default function DashboardPage({ user }) {
   const [activeAnswerMeta, setActiveAnswerMeta] = useState(null);
   const [showAdvancedStats, setShowAdvancedStats] = useState(false);
   const [useRag, setUseRag] = useState(true);
+  // User memory editor state
+  const [userMemorySummary, setUserMemorySummary] = useState("");
+  const [loadingUserMemory, setLoadingUserMemory] = useState(false);
+  const [savingUserMemory, setSavingUserMemory] = useState(false);
+  const [userMemoryError, setUserMemoryError] = useState(null);
 
   const messagesEndRef = useRef(null);
 
@@ -178,6 +183,58 @@ export default function DashboardPage({ user }) {
     }
   }
 
+  // Open settings modal and load user memory
+  function openSettingsModal() {
+    setIsSettingsOpen(false);
+    setIsSettingsModalOpen(true);
+    loadUserMemory();
+  }
+
+  async function loadUserMemory() {
+    setLoadingUserMemory(true);
+    setUserMemoryError(null);
+    try {
+      const res = await fetch("/api/user/memory");
+      const data = await res.json();
+      if (!res.ok) {
+        console.error(data.error || "Failed to load user memory");
+        setUserMemoryError(data.error || "Failed to load user memory.");
+        return;
+      }
+      setUserMemorySummary(data.memorySummary || "");
+    } catch (err) {
+      console.error("Error loading user memory:", err);
+      setUserMemoryError("Error loading user memory.");
+    } finally {
+      setLoadingUserMemory(false);
+    }
+  }
+
+  async function saveUserMemory() {
+    setSavingUserMemory(true);
+    setUserMemoryError(null);
+    try {
+      const res = await fetch("/api/user/memory", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ memorySummary: userMemorySummary }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        console.error(data.error || "Failed to save user memory");
+        setUserMemoryError(data.error || "Failed to save user memory.");
+        return;
+      }
+      // normalize summary from server in case it modified/trimmed it
+      setUserMemorySummary(data.memorySummary || "");
+    } catch (err) {
+      console.error("Error saving user memory:", err);
+      setUserMemoryError("Error saving user memory.");
+    } finally {
+      setSavingUserMemory(false);
+    }
+  }
+
   function handleSelectConversation(id) {
     setSelectedConversationId(id);
     setAnswerMetaByMessageId({});
@@ -290,12 +347,9 @@ export default function DashboardPage({ user }) {
       <aside className="flex h-screen w-72 flex-col border-r border-neutral-200 bg-white">
         <div className="border-b border-neutral-200 px-4 py-4 flex items-center justify-between">
           <div>
-            <h1 className="text-sm font-semibold text-neutral-900">
+            <h1 className="text-base font-semibold tracking-tight text-neutral-900">
               Retail AI Analyst
             </h1>
-            <p className="mt-1 text-xs text-neutral-500">
-              {user?.name || user?.email}
-            </p>
           </div>
         </div>
 
@@ -356,46 +410,48 @@ export default function DashboardPage({ user }) {
         </div>
 
         <div className="mt-auto px-4 pb-4">
-          <div className="relative flex justify-end">
-            <Button
-              type="button"
-              size="icon"
-              variant="outline"
-              className="h-8 w-8 border-none shadow-none text-neutral-700 hover:bg-neutral-100"
-              onClick={() => setIsSettingsOpen((prev) => !prev)}
-            >
-              <Settings className="h-4 w-4" />
-            </Button>
+          <div className="flex items-center justify-between gap-2">
+            <div className="max-w-[70%] truncate text-xs text-neutral-600">
+              {user?.name || user?.email}
+            </div>
+            <div className="relative">
+              <Button
+                type="button"
+                size="icon"
+                variant="outline"
+                className="h-8 w-8 border-none shadow-none text-neutral-700 hover:bg-neutral-100"
+                onClick={() => setIsSettingsOpen((prev) => !prev)}
+              >
+                <Settings className="h-4 w-4" />
+              </Button>
 
-            {isSettingsOpen && (
-              <div className="absolute bottom-10 right-0 w-40 rounded-md border border-neutral-200 bg-white shadow-lg text-xs">
-                <button
-                  type="button"
-                  className="block w-full px-3 py-2 text-left text-neutral-700 hover:bg-neutral-100"
-                  onClick={() => {
-                    setIsSettingsOpen(false);
-                    setIsSettingsModalOpen(true);
-                  }}
-                >
-                  Settings
-                </button>
-                <button
-                  type="button"
-                  className="block w-full px-3 py-2 text-left text-neutral-700 hover:bg-neutral-100"
-                  onClick={openUsageStats}
-                >
-                  Usage stats
-                </button>
-                <form method="POST" action="/api/auth/logout">
+              {isSettingsOpen && (
+                <div className="absolute bottom-10 right-0 w-40 rounded-md border border-neutral-200 bg-white shadow-lg text-xs">
                   <button
-                    type="submit"
-                    className="block w-full px-3 py-2 text-left text-red-600 hover:bg-neutral-100 border-t border-neutral-200"
+                    type="button"
+                    className="block w-full px-3 py-2 text-left text-neutral-700 hover:bg-neutral-100"
+                    onClick={openSettingsModal}
                   >
-                    Logout
+                    Settings
                   </button>
-                </form>
-              </div>
-            )}
+                  <button
+                    type="button"
+                    className="block w-full px-3 py-2 text-left text-neutral-700 hover:bg-neutral-100"
+                    onClick={openUsageStats}
+                  >
+                    Usage stats
+                  </button>
+                  <form method="POST" action="/api/auth/logout">
+                    <button
+                      type="submit"
+                      className="block w-full px-3 py-2 text-left text-red-600 hover:bg-neutral-100 border-t border-neutral-200"
+                    >
+                      Logout
+                    </button>
+                  </form>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </aside>
@@ -403,17 +459,17 @@ export default function DashboardPage({ user }) {
       {/* Main content */}
       <main className="flex flex-1 flex-col pl-4 pr-8 py-4 overflow-hidden">
         {isChatStarted ? (
-          <section className="flex flex-1 flex-col gap-3">
+          <section className="flex flex-1 min-h-0 flex-col gap-3">
             {/* Chat area */}
-            <Card className="flex min-h-[320px] flex-1 flex-col border-neutral-200 bg-white shadow-sm">
+            <Card className="flex min-h-[320px] flex-1 min-h-0 flex-col border-neutral-200 bg-white shadow-sm">
               <CardHeader className="border-b border-neutral-100 pb-2">
                 <CardTitle className="text-sm font-medium text-neutral-800">
                   Ask a question
                 </CardTitle>
               </CardHeader>
-              <CardContent className="flex flex-1 flex-col p-0">
+              <CardContent className="flex flex-1 min-h-0 flex-col p-0">
                 {/* Messages */}
-                <div className="flex-1 space-y-2 overflow-y-auto p-3 text-sm">
+                <div className="flex-1 min-h-0 space-y-2 overflow-y-auto p-3 text-sm">
                   {loadingMessages && (
                     <p className="text-xs text-neutral-500">
                       Loading messages…
@@ -546,6 +602,48 @@ export default function DashboardPage({ user }) {
                   />
                   <span>Enabled</span>
                 </label>
+              </div>
+
+              <div className="space-y-2">
+                <div className="text-[11px] font-semibold text-neutral-800">
+                  User memory summary
+                </div>
+                <div className="text-[11px] text-neutral-600">
+                  This is the long-term memory summary the system uses to
+                  understand your role, preferences, and recurring goals. You
+                  can edit it to override or refine what the AI has learned.
+                </div>
+                {userMemoryError && (
+                  <p className="text-[11px] text-red-600">{userMemoryError}</p>
+                )}
+                <textarea
+                  className="mt-1 h-40 w-full rounded-md border border-neutral-200 bg-neutral-50 p-2 text-[11px] leading-relaxed text-neutral-800 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-500"
+                  value={userMemorySummary}
+                  onChange={(e) => setUserMemorySummary(e.target.value)}
+                  placeholder="Describe your role, the metrics you care about, and any stable preferences you want the system to remember…"
+                />
+                <div className="mt-2 flex items-center justify-between">
+                  {loadingUserMemory ? (
+                    <span className="text-[11px] text-neutral-500">
+                      Loading current memory…
+                    </span>
+                  ) : (
+                    <span className="text-[11px] text-neutral-500">
+                      This summary is stored with your account and used across
+                      conversations.
+                    </span>
+                  )}
+                  <Button
+                    type="button"
+                    variant="default"
+                    size="sm"
+                    className="bg-neutral-900 text-neutral-50 hover:bg-neutral-800"
+                    onClick={saveUserMemory}
+                    disabled={savingUserMemory}
+                  >
+                    {savingUserMemory ? "Saving…" : "Save changes"}
+                  </Button>
+                </div>
               </div>
             </div>
           </div>

@@ -1,5 +1,5 @@
 // pages/api/chat/conversations.js
-import { getDb } from "../../../lib/db";
+import { getDb } from "../../../lib/db.mjs";
 import { getUserFromRequest } from "../../../lib/auth";
 
 export default async function handler(req, res) {
