@@ -15,46 +15,122 @@ const geistSans = Geist({
   subsets: ["latin"],
 });
 
+/*
+const geistMono = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+*/
+
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
 });
 
 // ===== Phase 4: AnswerPayload helpers =====
+function normalizeAnswerPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+
+  const normalized = { ...payload };
+
+  if (normalized.table && typeof normalized.table === "object") {
+    const table = normalized.table;
+    const rows = Array.isArray(table.rows) ? table.rows : [];
+    let columns = Array.isArray(table.columns) ? table.columns : [];
+
+    if (
+      columns.length === 0 &&
+      rows.length > 0 &&
+      rows[0] &&
+      typeof rows[0] === "object"
+    ) {
+      columns = Object.keys(rows[0]);
+    }
+
+    normalized.table = {
+      columns,
+      rows,
+      rowCount:
+        typeof table.rowCount === "number" ? table.rowCount : rows.length,
+      truncated: !!table.truncated,
+    };
+  }
+
+  return normalized;
+}
+
 function getAnswerPayloadFromApiResponse(data) {
   // Prefer the new payload if present; fall back to legacy fields.
-  if (data && data.answerPayload) return data.answerPayload;
-  const legacyTable = data?.table || null;
-  return {
-    version: "v1",
-    status: data?.status || "complete",
-    answerText: data?.answer || "",
-    table: legacyTable
-      ? {
-          columns: Array.isArray(legacyTable.columns)
-            ? legacyTable.columns
-            : [],
-          rows: Array.isArray(legacyTable.rows) ? legacyTable.rows : [],
-          rowCount: Array.isArray(legacyTable.rows)
-            ? legacyTable.rows.length
-            : 0,
-          truncated: false,
-        }
-      : {
-          columns: [],
-          rows: [],
-          rowCount: 0,
-          truncated: false,
-        },
+  let payload = data?.answerPayload || null;
 
-    downloads: [],
-    meta: {
-      sql: data?.sql || null,
-      sqlQueryId: data?.sqlQueryId || null,
-      tokens: data?.tokens || null,
-      rag: data?.rag || null,
-    },
-  };
+  if (!payload) {
+    const legacyTable = data?.table || null;
+    payload = {
+      version: "v1",
+      status: data?.status || "complete",
+      answerText: data?.answer || "",
+      table: legacyTable
+        ? {
+            columns: Array.isArray(legacyTable.columns)
+              ? legacyTable.columns
+              : [],
+            rows: Array.isArray(legacyTable.rows) ? legacyTable.rows : [],
+            rowCount: Array.isArray(legacyTable.rows)
+              ? legacyTable.rows.length
+              : 0,
+            truncated: false,
+          }
+        : {
+            columns: [],
+            rows: [],
+            rowCount: 0,
+            truncated: false,
+          },
+
+      downloads: [],
+      meta: {
+        sql: data?.sql || null,
+        sqlQueryId: data?.sqlQueryId || null,
+        tokens: data?.tokens || null,
+        rag: data?.rag || null,
+      },
+    };
+  }
+
+  return normalizeAnswerPayload(payload) || payload;
+}
+
+function buildAnswerMetaByMessage(messages, conversationId) {
+  const rebuilt = {};
+  if (!Array.isArray(messages)) return rebuilt;
+
+  messages.forEach((m) => {
+    if (m.role !== "assistant") return;
+    const rawPayload = m.answer_payload ?? m.answerPayload;
+    if (!rawPayload) return;
+
+    let parsedPayload = null;
+    try {
+      parsedPayload =
+        typeof rawPayload === "string" ? JSON.parse(rawPayload) : rawPayload;
+    } catch (err) {
+      console.error("Failed to parse answer payload for message", m.id, err);
+      return;
+    }
+
+    const normalized = normalizeAnswerPayload(parsedPayload);
+    if (!normalized) return;
+
+    rebuilt[m.id] = {
+      conversationId,
+      answerPayload: normalized,
+      sql: normalized?.meta?.sql ?? null,
+      tokens: normalized?.meta?.tokens ?? null,
+      rag: normalized?.meta?.rag ?? null,
+    };
+  });
+
+  return rebuilt;
 }
 
 function downloadCsvFromPayload(payload) {
@@ -88,7 +164,7 @@ function VirtualTable({ columns, rows, maxHeight = 420 }) {
       className="overflow-auto rounded-md border border-neutral-200 bg-white"
       style={{ maxHeight }}
     >
-      <table className="min-w-full border-collapse text-[11px]">
+      <table className="min-w-full border-collapse text-[12px]">
         <thead className="sticky top-0 z-10 bg-neutral-50">
           <tr>
             {columns.map((col) => (
@@ -189,6 +265,9 @@ export default function DashboardPage({ user }) {
   const [savingUserMemory, setSavingUserMemory] = useState(false);
   const [userMemoryError, setUserMemoryError] = useState(null);
 
+  const streamControllerRef = useRef(null);
+  const [hasStartedChat, setHasStartedChat] = useState(false);
+
   const messagesEndRef = useRef(null);
 
   // Auto scroll to bottom when messages change
@@ -201,6 +280,14 @@ export default function DashboardPage({ user }) {
   // Load conversations on mount
   useEffect(() => {
     fetchConversations();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (streamControllerRef.current) {
+        streamControllerRef.current.abort();
+      }
+    };
   }, []);
 
   async function fetchConversations() {
@@ -220,13 +307,21 @@ export default function DashboardPage({ user }) {
   async function fetchMessages(conversationId) {
     if (!conversationId) return;
     setLoadingMessages(true);
+
     try {
       const res = await fetch(
         `/api/chat/messages?conversationId=${conversationId}`
       );
       if (!res.ok) throw new Error("Failed to load messages");
+
       const data = await res.json();
-      setMessages(data.messages || []);
+      const msgs = data.messages || [];
+      setMessages(msgs);
+
+      const rebuiltMeta = buildAnswerMetaByMessage(msgs, conversationId);
+      setAnswerMetaByMessageId(rebuiltMeta);
+      setActiveAnswerMeta(null);
+      setActiveAnswerPayload(null);
     } catch (err) {
       console.error(err);
     } finally {
@@ -375,7 +470,12 @@ export default function DashboardPage({ user }) {
   }
 
   function handleSelectConversation(id) {
+    if (streamControllerRef.current) {
+      streamControllerRef.current.abort();
+      streamControllerRef.current = null;
+    }
     setSelectedConversationId(id);
+    setHasStartedChat(true);
     setAnswerMetaByMessageId({});
     setActiveAnswerMeta(null);
     setActiveAnswerPayload(null);
@@ -384,6 +484,10 @@ export default function DashboardPage({ user }) {
   }
 
   function handleNewConversation() {
+    if (streamControllerRef.current) {
+      streamControllerRef.current.abort();
+      streamControllerRef.current = null;
+    }
     setSelectedConversationId(null);
     setMessages([]);
     setQuestion("");
@@ -392,84 +496,223 @@ export default function DashboardPage({ user }) {
     setActiveAnswerMeta(null);
     setActiveAnswerPayload(null);
     setUseRag(true);
+    setHasStartedChat(false);
   }
 
   async function handleAsk(e) {
     e.preventDefault();
-    if (!question.trim()) return;
+    const trimmedQuestion = question.trim();
+    if (!trimmedQuestion || sending) return;
+
+    const tempUserMessage = {
+      id: `temp-user-${Date.now()}`,
+      role: "user",
+      content: trimmedQuestion,
+    };
+
+    const tempAssistantMessage = {
+      id: "streaming",
+      role: "assistant",
+      content: "Starting analysis…",
+    };
+
+    setMessages((prev) => [...prev, tempUserMessage, tempAssistantMessage]);
+    setQuestion("");
+    setHasStartedChat(true);
+
+    if (streamControllerRef.current) {
+      streamControllerRef.current.abort();
+      streamControllerRef.current = null;
+    }
+
+    const controller = new AbortController();
+    streamControllerRef.current = controller;
 
     setSending(true);
     try {
-      const res = await fetch("/api/chat/ask", {
+      const response = await fetch("/api/chat/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           conversationId: selectedConversationId,
-          question: question.trim(),
+          question: trimmedQuestion,
           useRag,
         }),
+        signal: controller.signal,
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        console.error(data.error || "Failed to send question");
-        setSending(false);
-        return;
+      if (!response.body) {
+        throw new Error("No response body received from server.");
       }
-      console.log("Ask response data:", data);
 
-      // Update state with returned conversation + messages
-      setSelectedConversationId(data.conversationId);
-      const msgs = data.messages || [];
-      setMessages(msgs);
-      setQuestion("");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let shouldStop = false;
 
-      // Store answer payload + meta for the latest assistant message, keyed by message id
-      if (data && data.conversationId) {
-        const latestAssistant = [...msgs]
-          .reverse()
-          .find((m) => m.role === "assistant");
-        if (latestAssistant) {
-          const payload = getAnswerPayloadFromApiResponse(data);
-          const meta = payload?.meta || {
-            sql: data.sql || null,
-            table: data.table || null,
-            tokens: data.tokens || null,
-            rag: data.rag || null,
-          };
-
-          setAnswerMetaByMessageId((prev) => ({
-            ...prev,
-            [latestAssistant.id]: {
-              conversationId: data.conversationId,
-              sql: meta.sql ?? data.sql ?? null,
-              table: payload?.table ?? data.table ?? null,
-              tokens: meta.tokens ?? data.tokens ?? null,
-              rag: meta.rag ?? data.rag ?? null,
-              answerPayload: payload,
-            },
-          }));
-
-          setActiveAnswerMeta({
-            conversationId: data.conversationId,
-            sql: meta.sql ?? data.sql ?? null,
-            table: payload?.table ?? data.table ?? null,
-            tokens: meta.tokens ?? data.tokens ?? null,
-            rag: meta.rag ?? data.rag ?? null,
-          });
-
-          setActiveAnswerPayload(payload);
+      const parseSseEvent = (chunk) => {
+        if (!chunk) {
+          return { eventName: "message", data: "" };
         }
+        const lines = chunk.split(/\r?\n/);
+        let eventName = "message";
+        const dataLines = [];
+
+        lines.forEach((line) => {
+          if (line.startsWith("event:")) {
+            eventName = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trim());
+          }
+        });
+
+        return { eventName, data: dataLines.join("\n") };
+      };
+
+      const handleSseEvent = (eventName, rawData) => {
+        let payload = null;
+        if (rawData) {
+          try {
+            payload = JSON.parse(rawData);
+          } catch (err) {
+            console.error("Failed to parse SSE payload:", err);
+          }
+        }
+
+        if (eventName === "status" && payload?.message) {
+          setMessages((prev) => {
+            let found = false;
+            const updated = prev.map((m) => {
+              if (m.id === "streaming") {
+                found = true;
+                return { ...m, content: payload.message };
+              }
+              return m;
+            });
+
+            if (!found) {
+              updated.push({
+                id: "streaming",
+                role: "assistant",
+                content: payload.message,
+              });
+            }
+
+            return updated;
+          });
+          return;
+        }
+
+        if (eventName === "final" && payload) {
+          shouldStop = true;
+          streamControllerRef.current = null;
+          const convId = payload.conversationId || selectedConversationId;
+          const serverMessages = Array.isArray(payload.messages)
+            ? payload.messages
+            : [];
+
+          setSelectedConversationId(convId);
+          setMessages(serverMessages);
+          const rebuiltMeta = buildAnswerMetaByMessage(serverMessages, convId);
+          setAnswerMetaByMessageId(rebuiltMeta);
+
+          const finalPayload = getAnswerPayloadFromApiResponse(payload);
+          setActiveAnswerPayload(finalPayload);
+          setActiveAnswerMeta(
+            finalPayload
+              ? {
+                  conversationId: convId,
+                  sql: finalPayload?.meta?.sql ?? null,
+                  table: finalPayload?.table ?? null,
+                  tokens: finalPayload?.meta?.tokens ?? null,
+                  rag: finalPayload?.meta?.rag ?? null,
+                }
+              : null
+          );
+
+          fetchConversations();
+          if (convId) {
+            fetchStats(convId);
+          }
+          return;
+        }
+
+        if (eventName === "error") {
+          shouldStop = true;
+          streamControllerRef.current = null;
+          const message =
+            payload?.message || "Unable to process your request right now.";
+          setMessages((prev) => [
+            ...prev.filter((m) => m.id !== "streaming"),
+            {
+              id: `error-${Date.now()}`,
+              role: "assistant",
+              content: `Error: ${message}`,
+            },
+          ]);
+          setActiveAnswerMeta(null);
+          setActiveAnswerPayload(null);
+          return;
+        }
+      };
+
+      const processBuffer = () => {
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary !== -1) {
+          const rawEvent = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const { eventName, data } = parseSseEvent(rawEvent);
+          handleSseEvent(eventName, data);
+          if (shouldStop) {
+            break;
+          }
+          boundary = buffer.indexOf("\n\n");
+        }
+      };
+
+      while (!shouldStop) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder
+          .decode(value, { stream: true })
+          .replace(/\r\n/g, "\n");
+        processBuffer();
+        if (shouldStop) break;
       }
 
-      // Refresh conversations list so updated_at moves to top
-      fetchConversations();
-      // Refresh stats for this conversation
-      fetchStats(data.conversationId);
+      buffer += decoder.decode().replace(/\r\n/g, "\n");
+      processBuffer();
+
+      if (!shouldStop) {
+        console.error("SSE connection closed before final event.");
+        setMessages((prev) => [
+          ...prev.filter((m) => m.id !== "streaming"),
+          {
+            id: `error-${Date.now()}`,
+            role: "assistant",
+            content: "Error: Connection closed unexpectedly.",
+          },
+        ]);
+        setActiveAnswerMeta(null);
+        setActiveAnswerPayload(null);
+      }
     } catch (err) {
-      console.error(err);
+      if (err.name === "AbortError") {
+        console.warn("Cancelled in-flight request.");
+      } else {
+        console.error("Error sending question:", err);
+        setMessages((prev) => [
+          ...prev.filter((m) => m.id !== "streaming"),
+          {
+            id: `error-${Date.now()}`,
+            role: "assistant",
+            content: "Error: Unable to process your request.",
+          },
+        ]);
+      }
     } finally {
       setSending(false);
+      streamControllerRef.current = null;
     }
   }
 
@@ -494,7 +737,7 @@ export default function DashboardPage({ user }) {
   }
 
   const hasConversations = conversations.length > 0;
-  const isChatStarted = !!selectedConversationId && messages.length > 0;
+  const isChatStarted = hasStartedChat || !!selectedConversationId;
   return (
     <div
       className={`${geistSans.className} ${geistMono.className} flex h-screen bg-neutral-100 font-sans dark:bg-black`}
@@ -503,7 +746,7 @@ export default function DashboardPage({ user }) {
       <aside className="flex h-screen w-72 flex-col border-r border-neutral-200 bg-white">
         <div className="border-b border-neutral-200 px-4 py-4 flex items-center justify-between">
           <div>
-            <h1 className="text-base font-semibold tracking-tight text-neutral-900">
+            <h1 className="text-2xl font-semibold tracking-tight text-neutral-900">
               Retail AI Analyst
             </h1>
           </div>
@@ -512,7 +755,7 @@ export default function DashboardPage({ user }) {
         <div className="flex items-center justify-between px-2 pt-3 pb-2">
           <Button
             size="sm"
-            className="h-10 w-full bg-neutral-900 text-[11px] text-neutral-50 hover:bg-neutral-800"
+            className="h-10 w-full bg-red-900 text-[12px] text-neutral-50 hover:bg-red-800"
             onClick={handleNewConversation}
           >
             Start New Analysis
@@ -524,12 +767,12 @@ export default function DashboardPage({ user }) {
             <CardContent className="h-full p-0">
               <div className="flex h-full max-h-full flex-col divide-y divide-neutral-100 overflow-y-auto">
                 {loadingConversations && (
-                  <div className="p-3 text-xs text-neutral-500">
+                  <div className="p-3 text-sm text-neutral-500">
                     Loading conversations…
                   </div>
                 )}
                 {!loadingConversations && conversations.length === 0 && (
-                  <div className="p-3 text-xs text-neutral-500">
+                  <div className="p-3 text-sm text-neutral-500">
                     No conversations yet. Ask your first question.
                   </div>
                 )}
@@ -538,9 +781,9 @@ export default function DashboardPage({ user }) {
                     key={conv.id}
                     type="button"
                     onClick={() => handleSelectConversation(conv.id)}
-                    className={`flex w-full flex-col items-start px-3 py-2 text-left text-xs transition ${
+                    className={`flex w-full flex-col items-start px-3 py-2 text-left text-sm transition ${
                       selectedConversationId === conv.id
-                        ? "bg-neutral-400 text-neutral-50 rounded-xs"
+                        ? "bg-red-50 text-red-800 rounded-xs"
                         : "hover:bg-neutral-100"
                     }`}
                   >
@@ -551,7 +794,7 @@ export default function DashboardPage({ user }) {
                       <span
                         className={`mt-0.5 line-clamp-2 ${
                           selectedConversationId === conv.id
-                            ? "text-neutral-200"
+                            ? "text-neutral-400"
                             : "text-neutral-500"
                         }`}
                       >
@@ -567,7 +810,7 @@ export default function DashboardPage({ user }) {
 
         <div className="mt-auto px-4 pb-4">
           <div className="flex items-center justify-between gap-2">
-            <div className="max-w-[70%] truncate text-xs text-neutral-600">
+            <div className="max-w-[70%] truncate text-sm text-neutral-600">
               {user?.name || user?.email}
             </div>
             <div className="relative">
@@ -582,7 +825,7 @@ export default function DashboardPage({ user }) {
               </Button>
 
               {isSettingsOpen && (
-                <div className="absolute bottom-10 right-0 w-40 rounded-md border border-neutral-200 bg-white shadow-lg text-xs">
+                <div className="absolute bottom-10 right-0 w-40 rounded-md border border-neutral-200 bg-white shadow-lg text-sm">
                   <button
                     type="button"
                     className="block w-full px-3 py-2 text-left text-neutral-700 hover:bg-neutral-100"
@@ -613,26 +856,26 @@ export default function DashboardPage({ user }) {
       </aside>
 
       {/* Main content */}
-      <main className="flex flex-1 flex-col pl-4 pr-8 py-4 overflow-hidden">
+      <main className="flex flex-1 flex-col pl-8 pb-0 -mt-8  pt-0 overflow-hidden">
         {isChatStarted ? (
           <section className="flex flex-1 min-h-0 flex-col gap-3">
             {/* Chat area */}
-            <Card className="flex flex-1 flex-col  bg-neutral-100 border-none shadow-none">
+            <Card className="flex flex-1 flex-col min-h-0 bg-neutral-100 border-none shadow-none ">
               <CardHeader className="border-b border-neutral-100 pb-2">
-                <CardTitle className="text-sm font-medium text-neutral-800">
+                <CardTitle className="text-md font-medium text-neutral-800">
                   {/*Ask a question*/}
                 </CardTitle>
               </CardHeader>
               <CardContent className="flex flex-1 min-h-0 flex-col p-0">
                 {/* Messages */}
-                <div className="flex-1 min-h-0 space-y-4 overflow-y-auto p-3 text-sm">
+                <div className="flex-1 min-h-0 space-y-4 overflow-y-auto p-3 text-md pr-8">
                   {loadingMessages && (
-                    <p className="text-xs text-neutral-500">
+                    <p className="text-sm text-neutral-500">
                       Loading messages…
                     </p>
                   )}
                   {!loadingMessages && messages.length === 0 && (
-                    <p className="text-xs text-neutral-500">
+                    <p className="text-sm text-neutral-500">
                       Start a new conversation or pick an existing one.
                     </p>
                   )}
@@ -647,14 +890,14 @@ export default function DashboardPage({ user }) {
                         }`}
                       >
                         {isUser ? (
-                          <div className="max-w-[75%] rounded-md bg-neutral-400 px-3 py-2 text-xs leading-relaxed text-neutral-50">
+                          <div className="max-w-[75%] rounded-md bg-neutral-400 px-3 py-2 text-sm leading-relaxed text-neutral-50">
                             {msg.content}
                           </div>
                         ) : (
                           <div className="w-full max-w-[75%] mb-3">
                             {/* Answer bubble */}
                             <div
-                              className="rounded-md border border-neutral-200 bg-white px-3 py-2 text-xs leading-relaxed text-neutral-800 cursor-pointer hover:bg-neutral-50"
+                              className="rounded-md border border-neutral-200 bg-white px-3 py-2 text-sm leading-relaxed text-neutral-800 cursor-pointer hover:bg-neutral-50"
                               onClick={() => handleOpenStatsForMessage(msg)}
                             >
                               {msg.content}
@@ -677,7 +920,7 @@ export default function DashboardPage({ user }) {
                                 return (
                                   <div className="mt-2 rounded-md border border-neutral-200 bg-white">
                                     <div className="flex items-center justify-between border-b border-neutral-100 px-3 py-2">
-                                      <div className="text-[11px] font-semibold text-neutral-800">
+                                      <div className="text-[12px] font-semibold text-neutral-800">
                                         Results
                                       </div>
                                       <div className="flex items-center gap-2">
@@ -715,7 +958,7 @@ export default function DashboardPage({ user }) {
                                       />
                                     ) : (
                                       <div className="max-h-80 overflow-auto">
-                                        <table className="min-w-full border-collapse text-[11px]">
+                                        <table className="min-w-full border-collapse text-[12px]">
                                           <thead className="sticky top-0 z-10 bg-neutral-50">
                                             <tr>
                                               {columns.map((col) => (
@@ -778,20 +1021,20 @@ export default function DashboardPage({ user }) {
                 {/* Input */}
                 <form
                   onSubmit={handleAsk}
-                  className="border-t border-neutral-100 p-3"
+                  className="border-t border-neutral-300 p-3 -ml-8 bg-white"
                 >
-                  <div className="flex gap-2">
+                  <div className="flex gap-2 mr-8">
                     <Input
                       placeholder="Ask about your data, metrics, trends…"
                       value={question}
                       onChange={(e) => setQuestion(e.target.value)}
                       disabled={sending}
-                      className="bg-neutral-50 text-sm focus-visible:ring-neutral-500"
+                      className="bg-neutral-50 ml-8 text-md focus-visible:ring-neutral-500"
                     />
                     <Button
                       type="submit"
                       disabled={sending || !question.trim()}
-                      className="bg-neutral-900 text-neutral-50 hover:bg-neutral-800"
+                      className="bg-red-900 text-neutral-50 hover:bg-neutral-800"
                     >
                       {sending ? "Asking…" : "Ask"}
                     </Button>
@@ -804,7 +1047,7 @@ export default function DashboardPage({ user }) {
           <section className="flex flex-1 items-center justify-center -mt-32">
             <Card className="w-full max-w-4xl border-none shadow-none bg-gray-100">
               <CardHeader>
-                <CardTitle className="text-sm font-medium text-neutral-800"></CardTitle>
+                <CardTitle className="text-md font-medium text-neutral-800"></CardTitle>
               </CardHeader>
               <CardContent>
                 <form onSubmit={handleAsk} className="space-y-3">
@@ -814,7 +1057,7 @@ export default function DashboardPage({ user }) {
                       value={question}
                       onChange={(e) => setQuestion(e.target.value)}
                       disabled={sending}
-                      className="bg-neutral-50 text-sm h-14 flex-1 focus-visible:ring-neutral-500"
+                      className="bg-neutral-50 text-md h-14 flex-1 focus-visible:ring-neutral-500"
                     />
                     <Button
                       type="submit"
@@ -836,7 +1079,7 @@ export default function DashboardPage({ user }) {
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40">
           <div className="w-full max-w-md rounded-lg border border-neutral-200 bg-white shadow-lg">
             <div className="flex items-center justify-between border-b border-neutral-100 px-4 py-3">
-              <h2 className="text-sm font-medium text-neutral-900">Settings</h2>
+              <h2 className="text-md font-medium text-neutral-900">Settings</h2>
               <Button
                 type="button"
                 variant="outline"
@@ -847,18 +1090,18 @@ export default function DashboardPage({ user }) {
                 Close
               </Button>
             </div>
-            <div className="space-y-4 px-4 py-4 text-xs">
+            <div className="space-y-4 px-4 py-4 text-sm">
               <div className="flex items-center justify-between">
                 <div>
-                  <div className="text-[11px] font-semibold text-neutral-800">
+                  <div className="text-[12px] font-semibold text-neutral-800">
                     Use business context (RAG)
                   </div>
-                  <div className="text-[11px] text-neutral-600">
+                  <div className="text-[12px] text-neutral-600">
                     When enabled, your questions are enriched with schema and
                     business documentation from the vector database.
                   </div>
                 </div>
-                <label className="ml-4 inline-flex items-center gap-2 text-[11px] text-neutral-700">
+                <label className="ml-4 inline-flex items-center gap-2 text-[12px] text-neutral-700">
                   <input
                     type="checkbox"
                     className="h-3 w-3"
@@ -871,15 +1114,15 @@ export default function DashboardPage({ user }) {
 
               <div className="flex items-center justify-between">
                 <div>
-                  <div className="text-[11px] font-semibold text-neutral-800">
+                  <div className="text-[12px] font-semibold text-neutral-800">
                     Show tables inline
                   </div>
-                  <div className="text-[11px] text-neutral-600">
+                  <div className="text-[12px] text-neutral-600">
                     When enabled, query result tables appear directly under each
                     AI answer.
                   </div>
                 </div>
-                <label className="ml-4 inline-flex items-center gap-2 text-[11px] text-neutral-700">
+                <label className="ml-4 inline-flex items-center gap-2 text-[12px] text-neutral-700">
                   <input
                     type="checkbox"
                     className="h-3 w-3"
@@ -891,30 +1134,30 @@ export default function DashboardPage({ user }) {
               </div>
 
               <div className="space-y-2">
-                <div className="text-[11px] font-semibold text-neutral-800">
+                <div className="text-[12px] font-semibold text-neutral-800">
                   User memory summary
                 </div>
-                <div className="text-[11px] text-neutral-600">
+                <div className="text-[12px] text-neutral-600">
                   This is the long-term memory summary the system uses to
                   understand your role, preferences, and recurring goals. You
                   can edit it to override or refine what the AI has learned.
                 </div>
                 {userMemoryError && (
-                  <p className="text-[11px] text-red-600">{userMemoryError}</p>
+                  <p className="text-[12px] text-red-600">{userMemoryError}</p>
                 )}
                 <textarea
-                  className="mt-1 h-40 w-full rounded-md border border-neutral-200 bg-neutral-50 p-2 text-[11px] leading-relaxed text-neutral-800 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-500"
+                  className="mt-1 h-40 w-full rounded-md border border-neutral-200 bg-neutral-50 p-2 text-[12px] leading-relaxed text-neutral-800 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-500"
                   value={userMemorySummary}
                   onChange={(e) => setUserMemorySummary(e.target.value)}
                   placeholder="Describe your role, the metrics you care about, and any stable preferences you want the system to remember…"
                 />
                 <div className="mt-2 flex items-center justify-between">
                   {loadingUserMemory ? (
-                    <span className="text-[11px] text-neutral-500">
+                    <span className="text-[12px] text-neutral-500">
                       Loading current memory…
                     </span>
                   ) : (
-                    <span className="text-[11px] text-neutral-500">
+                    <span className="text-[12px] text-neutral-500">
                       This summary is stored with your account and used across
                       conversations.
                     </span>
@@ -941,7 +1184,7 @@ export default function DashboardPage({ user }) {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
           <div className="w-full max-w-3xl rounded-lg border border-neutral-200 bg-white shadow-lg">
             <div className="flex items-center justify-between border-b border-neutral-100 px-4 py-3">
-              <h2 className="text-sm font-medium text-neutral-900">
+              <h2 className="text-md font-medium text-neutral-900">
                 Usage statistics
               </h2>
               <Button
@@ -954,7 +1197,7 @@ export default function DashboardPage({ user }) {
                 Close
               </Button>
             </div>
-            <div className="space-y-4 px-4 py-4 text-xs">
+            <div className="space-y-4 px-4 py-4 text-sm">
               {usageLoading ? (
                 <p className="text-neutral-500">Loading usage stats…</p>
               ) : (
@@ -962,7 +1205,7 @@ export default function DashboardPage({ user }) {
                   {/* Summary widgets */}
                   <div className="grid gap-3 md:grid-cols-3">
                     <div className="rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3">
-                      <div className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+                      <div className="text-[12px] font-semibold uppercase tracking-wide text-neutral-500">
                         Lifetime tokens
                       </div>
                       <div className="mt-1 text-lg font-semibold text-neutral-900">
@@ -970,7 +1213,7 @@ export default function DashboardPage({ user }) {
                       </div>
                     </div>
                     <div className="rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3">
-                      <div className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+                      <div className="text-[12px] font-semibold uppercase tracking-wide text-neutral-500">
                         This month
                       </div>
                       <div className="mt-1 text-lg font-semibold text-neutral-900">
@@ -978,7 +1221,7 @@ export default function DashboardPage({ user }) {
                       </div>
                     </div>
                     <div className="rounded-md border border-neutral-200 bg-neutral-50 px-3 py-3">
-                      <div className="text-[11px] font-semibold uppercase tracking-wide text-neutral-500">
+                      <div className="text-[12px] font-semibold uppercase tracking-wide text-neutral-500">
                         This week
                       </div>
                       <div className="mt-1 text-lg font-semibold text-neutral-900">
@@ -989,11 +1232,11 @@ export default function DashboardPage({ user }) {
 
                   {/* Daily chart (simple bar chart) */}
                   <div>
-                    <div className="mb-1 text-[11px] font-semibold text-neutral-700">
+                    <div className="mb-1 text-[12px] font-semibold text-neutral-700">
                       Daily token usage (last 30 days)
                     </div>
                     {usageSummary.daily.length === 0 ? (
-                      <p className="text-[11px] text-neutral-500">
+                      <p className="text-[12px] text-neutral-500">
                         No usage recorded yet.
                       </p>
                     ) : (
@@ -1071,11 +1314,11 @@ export default function DashboardPage({ user }) {
           <div className="w-full max-w-2xl max-h-[85vh] overflow-hidden rounded-lg border border-neutral-200 bg-white shadow-lg">
             <div className="flex items-center justify-between border-b border-neutral-100 px-4 py-3">
               <div>
-                <h2 className="text-sm font-medium text-neutral-900">
+                <h2 className="text-md font-medium text-neutral-900">
                   SQL queries &amp; token usage
                 </h2>
                 {activeAnswer && (
-                  <p className="mt-1 line-clamp-2 text-xs text-neutral-500">
+                  <p className="mt-1 line-clamp-2 text-sm text-neutral-500">
                     For answer: {activeAnswer.content}
                   </p>
                 )}
@@ -1092,7 +1335,7 @@ export default function DashboardPage({ user }) {
             </div>
 
             <div
-              className="space-y-4 px-4 py-3 text-xs overflow-y-auto"
+              className="space-y-4 px-4 py-3 text-sm overflow-y-auto"
               style={{ maxHeight: "calc(85vh - 56px)" }}
             >
               {!selectedConversationId ? (
@@ -1105,7 +1348,7 @@ export default function DashboardPage({ user }) {
                     <div className="space-y-3 rounded-md border border-neutral-100 bg-neutral-50 px-3 py-3">
                       {activeAnswerMeta.sql && (
                         <div>
-                          <div className="mb-1 text-[11px] font-semibold text-neutral-700">
+                          <div className="mb-1 text-[12px] font-semibold text-neutral-700">
                             SQL for this answer
                           </div>
                           <pre className="max-h-32 overflow-auto rounded-md bg-neutral-900 px-3 py-2 font-mono text-[10px] text-neutral-50">
@@ -1114,7 +1357,7 @@ export default function DashboardPage({ user }) {
                         </div>
                       )}
                       {activeAnswerMeta.tokens && (
-                        <div className="text-[11px] text-neutral-700">
+                        <div className="text-[12px] text-neutral-700">
                           Tokens – model{" "}
                           <span className="font-mono">
                             {activeAnswerMeta.tokens.model}
@@ -1125,7 +1368,7 @@ export default function DashboardPage({ user }) {
                         </div>
                       )}
                       {activeAnswerPayload?.table && (
-                        <div className="text-[11px] text-neutral-700">
+                        <div className="text-[12px] text-neutral-700">
                           Rows returned:{" "}
                           {activeAnswerPayload.table.rowCount?.toLocaleString?.() ||
                             activeAnswerPayload.table.rowCount ||
@@ -1143,7 +1386,7 @@ export default function DashboardPage({ user }) {
                       ) && (
                         <div className="flex items-center justify-between rounded-md border border-neutral-200 bg-white px-3 py-2">
                           <div>
-                            <div className="text-[11px] font-semibold text-neutral-800">
+                            <div className="text-[12px] font-semibold text-neutral-800">
                               Download
                             </div>
                             <div className="text-[10px] text-neutral-600">
@@ -1169,7 +1412,7 @@ export default function DashboardPage({ user }) {
                         activeAnswerMeta.rag.sources &&
                         activeAnswerMeta.rag.sources.length > 0 && (
                           <div className="mt-2 space-y-1">
-                            <div className="text-[11px] font-semibold text-neutral-700">
+                            <div className="text-[12px] font-semibold text-neutral-700">
                               Source materials used for this answer (
                               {activeAnswerMeta.rag.sources.length})
                             </div>
@@ -1179,7 +1422,7 @@ export default function DashboardPage({ user }) {
                                   key={src.id}
                                   className="border-b border-neutral-100 pb-1 last:border-b-0 last:pb-0"
                                 >
-                                  <div className="text-[11px] font-medium text-neutral-800">
+                                  <div className="text-[12px] font-medium text-neutral-800">
                                     {src.title}
                                   </div>
                                   <div className="text-[10px] text-neutral-600">
@@ -1209,7 +1452,7 @@ export default function DashboardPage({ user }) {
                         activeAnswerMeta.table.rows &&
                         activeAnswerMeta.table.rows.length > 0 && (
                           <div>
-                            <div className="mb-1 text-[11px] font-semibold text-neutral-700">
+                            <div className="mb-1 text-[12px] font-semibold text-neutral-700">
                               Result preview for this answer (
                               {activeAnswerMeta.table.rows.length} rows)
                             </div>
@@ -1230,7 +1473,7 @@ export default function DashboardPage({ user }) {
 
                               return (
                                 <div className="max-h-40 overflow-auto rounded-md border border-neutral-200 bg-white">
-                                  <table className="min-w-full border-collapse text-[11px]">
+                                  <table className="min-w-full border-collapse text-[12px]">
                                     <thead className="bg-neutral-50">
                                       <tr>
                                         {cols.map((col) => (
@@ -1278,7 +1521,7 @@ export default function DashboardPage({ user }) {
                     <button
                       type="button"
                       onClick={() => setShowAdvancedStats((prev) => !prev)}
-                      className="text-[11px] font-medium text-neutral-600 underline-offset-2 hover:underline"
+                      className="text-[12px] font-medium text-neutral-600 underline-offset-2 hover:underline"
                     >
                       {showAdvancedStats ? "Hide more info" : "More info"}
                     </button>
@@ -1289,7 +1532,7 @@ export default function DashboardPage({ user }) {
                       {/* Recent SQL queries */}
                       <div>
                         <div className="mb-1 flex items-center justify-between">
-                          <h3 className="text-xs font-semibold text-neutral-700">
+                          <h3 className="text-sm font-semibold text-neutral-700">
                             Recent SQL queries
                           </h3>
                           {loadingStats && (
@@ -1305,7 +1548,7 @@ export default function DashboardPage({ user }) {
                         )}
                         {!loadingStats && stats.sqlQueries.length > 0 && (
                           <div className="max-h-40 overflow-y-auto rounded-md border border-neutral-100">
-                            <table className="w-full border-collapse text-[11px]">
+                            <table className="w-full border-collapse text-[12px]">
                               <thead className="bg-neutral-50 text-neutral-500">
                                 <tr>
                                   <th className="px-2 py-1 text-left font-medium">
@@ -1347,7 +1590,7 @@ export default function DashboardPage({ user }) {
                       {/* Recent token usage */}
                       <div>
                         <div className="mb-1 flex items-center justify-between">
-                          <h3 className="text-xs font-semibold text-neutral-700">
+                          <h3 className="text-sm font-semibold text-neutral-700">
                             Recent token usage
                           </h3>
                         </div>
@@ -1358,7 +1601,7 @@ export default function DashboardPage({ user }) {
                         )}
                         {!loadingStats && stats.tokenUsage.length > 0 && (
                           <div className="max-h-40 overflow-y-auto rounded-md border border-neutral-100">
-                            <table className="w-full border-collapse text-[11px]">
+                            <table className="w-full border-collapse text-[12px]">
                               <thead className="bg-neutral-50 text-neutral-500">
                                 <tr>
                                   <th className="px-2 py-1 text-left font-medium">

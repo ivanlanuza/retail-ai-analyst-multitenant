@@ -20,7 +20,7 @@ const MIN_MESSAGES_FOR_SUMMARY = 6; // minimum before summarizing
 
 // ===== Phase 4: AnswerPayload + CSV export =====
 const MAX_TABLE_ROWS_IN_RESPONSE = 20; // must match prompt rule unless user asks otherwise
-const CSV_EXPORT_ROW_THRESHOLD = 200; // when >= this, include csv export payload
+const CSV_EXPORT_ROW_THRESHOLD = 100; // when >= this, include csv export payload
 
 const TableSchema = z.object({
   columns: z.array(z.string()),
@@ -152,6 +152,7 @@ async function buildNonDataResponse(question) {
       "system",
       [
         "You are the assistant for a retail analytics tool that answers questions by querying business data (via SQL).",
+        "This tool is specifically for understanding the customer loyalty information stored in the database.",
         "Sometimes users send messages that are not actually data questions (e.g., small talk, how-the-system-works questions, meta questions, or vague comments).",
         "",
         "Your job is to:",
@@ -335,23 +336,52 @@ function deriveConversationTitle(question) {
 }
 
 export default async function handler(req, res) {
+  // IMPORTANT: enable streaming immediately so all responses use SSE
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  function emit(event, data) {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  }
+
+  function closeWith(event, payload, statusCode = 200) {
+    res.statusCode = statusCode;
+    emit(event, payload);
+    res.end();
+  }
+
+  function streamError(statusCode, code, message, extra = {}) {
+    closeWith("error", { code, message, ...extra }, statusCode);
+  }
+
   if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
+    streamError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+    return;
   }
 
   const user = await getUserFromRequest(req);
   if (!user) {
-    return res.status(401).json({ error: "Unauthorized" });
+    streamError(401, "UNAUTHORIZED", "Unauthorized");
+    return;
   }
 
-  const { conversationId, question, useRag = true } = req.body || {};
+  emit("status", { message: "Starting analysis…" });
+
+  const { conversationId, question, useRag } =
+    req.method === "POST" ? req.body : req.query;
+
+  const useRagBool = useRag === "1" || useRag === true;
 
   if (
     !question ||
     typeof question !== "string" ||
     question.trim().length === 0
   ) {
-    return res.status(400).json({ error: "Question is required" });
+    streamError(400, "INVALID_REQUEST", "Question is required");
+    return;
   }
 
   try {
@@ -372,7 +402,8 @@ export default async function handler(req, res) {
         [convId, user.id]
       );
       if (existing.length === 0) {
-        return res.status(404).json({ error: "Conversation not found" });
+        streamError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+        return;
       }
     }
 
@@ -382,6 +413,7 @@ export default async function handler(req, res) {
       [convId, user.id, "user", question.trim()]
     );
     const userMessageId = userMsgResult.insertId;
+    emit("status", { message: "Understanding your question…" });
 
     // 2.0) Quick classification: is this a data question?
     let isDataRequest = true;
@@ -393,6 +425,12 @@ export default async function handler(req, res) {
       isDataRequest = true;
     }
 
+    emit("status", {
+      message: isDataRequest
+        ? "Preparing to query your data…"
+        : "Preparing response…",
+    });
+
     if (!isDataRequest) {
       let acknowledgment;
       try {
@@ -403,26 +441,6 @@ export default async function handler(req, res) {
           'Got it. This assistant is wired to answer questions by querying your data (for example: "Show me sales by store for last month" or "Compare loyalty signups by branch"). ' +
           "If you’d like, ask what you want to see in the data and I’ll run the query for you.";
       }
-
-      // Store assistant message so the conversation thread stays consistent
-      const assistantMsgResult = await query(
-        "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
-        [convId, null, "assistant", acknowledgment]
-      );
-      const assistantMessageId = assistantMsgResult.insertId;
-
-      // Optionally log token usage as zeroed for this non-data turn
-      await query(
-        `INSERT INTO token_usage
-         (conversation_id, message_id, user_id, model, prompt_tokens, completion_tokens, total_tokens)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [convId, assistantMessageId, user.id, MODEL_NAME, 0, 0, 0]
-      );
-
-      const messages = await query(
-        "SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
-        [convId]
-      );
 
       // Phase 4: answerPayload for non-data
       const answerPayload = {
@@ -455,33 +473,43 @@ export default async function handler(req, res) {
         },
       };
 
-      return res.status(200).json({
-        answerPayload,
+      // Store assistant message so the conversation thread stays consistent
+      const assistantMsgResult = await query(
+        `INSERT INTO messages
+   (conversation_id, user_id, role, content, answer_payload)
+   VALUES (?, ?, ?, ?, ?)`,
+        [
+          convId,
+          null,
+          "assistant",
+          acknowledgment,
+          JSON.stringify(answerPayload),
+        ]
+      );
+      const assistantMessageId = assistantMsgResult.insertId;
+
+      // Optionally log token usage as zeroed for this non-data turn
+      await query(
+        `INSERT INTO token_usage
+         (conversation_id, message_id, user_id, model, prompt_tokens, completion_tokens, total_tokens)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [convId, assistantMessageId, user.id, MODEL_NAME, 0, 0, 0]
+      );
+
+      const messages = await query(
+        "SELECT id, role, content, answer_payload, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
+        [convId]
+      );
+
+      closeWith("final", {
         conversationId: convId,
         messages,
-        status: "non_data",
-        answer: acknowledgment,
-        sql: null,
-        table: {
-          columns: [],
-          rows: [],
-        },
-        tokens: {
-          model: MODEL_NAME,
-          input: 0,
-          output: 0,
-          total: 0,
-        },
-        sqlQueryId: null,
-        rag: {
-          requested: false,
-          used: false,
-          error: null,
-          sourceCount: 0,
-          sources: [],
-        },
+        answerPayload,
       });
+      return;
     }
+
+    emit("status", { message: "Gathering user context…" });
 
     // 2.1) Fetch existing conversation summary + user long-term memory for this request
     let conversationSummaryForPrompt = "";
@@ -518,11 +546,12 @@ export default async function handler(req, res) {
       console.error("Error building recent Q&A context:", qaErr);
     }
 
+    emit("status", { message: "Getting Business Context..." });
     // 3) RAG: retrieve context from vector DB (optional)
     let retrievedDocs = [];
     let ragError = null;
 
-    if (useRag) {
+    if (useRagBool) {
       try {
         const vectorStore = await getVectorStore();
         // tweak k / filters as needed
@@ -588,6 +617,7 @@ export default async function handler(req, res) {
         ? contextParts.join("\n\n---\n\n")
         : "(No additional RAG or memory context available.)";
 
+    emit("status", { message: "Generating SQL query…" });
     // 4) Build NL -> SQL prompt using schema introspection + memory + RAG context
     const schemaText = await getSchemaText();
 
@@ -645,6 +675,7 @@ export default async function handler(req, res) {
       total_tokens: 0,
     };
 
+    emit("status", { message: "Running query on database…" });
     // 5) Execute SQL
     let rows = [];
     let fields = [];
@@ -685,20 +716,24 @@ export default async function handler(req, res) {
     const sqlQueryId = sqlQueryResult.insertId;
 
     if (executionError) {
-      // For Phase 1/2/3: return SQL + error so you can debug prompt/chain
-      return res.status(400).json({
-        error: "SQL_EXECUTION_ERROR",
-        message: errorMessage,
-        sql,
-        conversationId: convId,
-        rag: {
-          requested: !!useRag,
-          used: !!useRag && retrievedDocs.length > 0,
-          error: ragError,
-        },
-      });
+      streamError(
+        400,
+        "SQL_EXECUTION_ERROR",
+        errorMessage || "SQL execution failed",
+        {
+          sql,
+          conversationId: convId,
+          rag: {
+            requested: useRagBool,
+            used: useRagBool && retrievedDocs.length > 0,
+            error: ragError,
+          },
+        }
+      );
+      return;
     }
 
+    emit("status", { message: "Summarizing results…" });
     // 7) Generate short text answer based on rows
     const sampleRows = rows.slice(0, 50);
 
@@ -773,7 +808,7 @@ export default async function handler(req, res) {
       (sqlUsage.total_tokens || 0) + (answerUsage.total_tokens || 0);
 
     // 8) Telemetry: log query, answer, and RAG sources
-    const usedRagFlag = !!useRag && retrievedDocs.length > 0;
+    const usedRagFlag = useRagBool && retrievedDocs.length > 0;
     const answerSummary =
       answerText && answerText.length > 500
         ? answerText.slice(0, 497) + "..."
@@ -843,46 +878,6 @@ export default async function handler(req, res) {
       }
     }
 
-    // 9) Store assistant message
-    const assistantMsgResult = await query(
-      "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
-      [convId, null, "assistant", answerText]
-    );
-    const assistantMessageId = assistantMsgResult.insertId;
-
-    // 10) Store token usage
-    await query(
-      `INSERT INTO token_usage
-       (conversation_id, message_id, user_id, model, prompt_tokens, completion_tokens, total_tokens)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        convId,
-        assistantMessageId,
-        user.id,
-        MODEL_NAME,
-        totalInputTokens,
-        totalOutputTokens,
-        totalTokens,
-      ]
-    );
-
-    // 11) Fetch full conversation messages for the frontend
-    const messages = await query(
-      "SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
-      [convId]
-    );
-
-    // 11.1) Maybe update conversation summary (for future turns)
-    try {
-      await maybeUpdateConversationSummary(
-        convId,
-        messages,
-        conversationSummaryForPrompt
-      );
-    } catch (summaryErr) {
-      console.error("Error updating conversation summary:", summaryErr);
-    }
-
     const columns = fields.map((f) => f.name);
 
     // Phase 4: table + export handling
@@ -948,14 +943,56 @@ export default async function handler(req, res) {
           total: totalTokens,
         },
         rag: {
-          requested: !!useRag,
-          used: !!useRag && retrievedDocs.length > 0,
+          requested: useRagBool,
+          used: useRagBool && retrievedDocs.length > 0,
           error: ragError,
           sourceCount: ragSources.length,
           sources: ragSources,
         },
       },
     };
+
+    // 9) Store assistant message
+    const assistantMsgResult = await query(
+      `INSERT INTO messages
+   (conversation_id, user_id, role, content, answer_payload)
+   VALUES (?, ?, ?, ?, ?)`,
+      [convId, null, "assistant", answerText, JSON.stringify(answerPayload)]
+    );
+    const assistantMessageId = assistantMsgResult.insertId;
+
+    // 10) Store token usage
+    await query(
+      `INSERT INTO token_usage
+       (conversation_id, message_id, user_id, model, prompt_tokens, completion_tokens, total_tokens)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        convId,
+        assistantMessageId,
+        user.id,
+        MODEL_NAME,
+        totalInputTokens,
+        totalOutputTokens,
+        totalTokens,
+      ]
+    );
+
+    // 11) Fetch full conversation messages for the frontend
+    const messages = await query(
+      "SELECT id, role, content, answer_payload, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
+      [convId]
+    );
+
+    // 11.1) Maybe update conversation summary (for future turns)
+    try {
+      await maybeUpdateConversationSummary(
+        convId,
+        messages,
+        conversationSummaryForPrompt
+      );
+    } catch (summaryErr) {
+      console.error("Error updating conversation summary:", summaryErr);
+    }
 
     // Best-effort validation; do not crash the request if schema mismatches
     try {
@@ -964,8 +1001,15 @@ export default async function handler(req, res) {
       console.error("AnswerPayload validation failed (non-fatal):", apErr);
     }
 
-    console.log(answerPayload);
+    //console.log(answerPayload);
 
+    closeWith("final", {
+      conversationId: convId,
+      messages,
+      answerPayload,
+    });
+
+    /*
     return res.status(200).json({
       answerPayload,
       conversationId: convId,
@@ -985,15 +1029,17 @@ export default async function handler(req, res) {
       },
       sqlQueryId,
       rag: {
-        requested: !!useRag,
-        used: !!useRag && retrievedDocs.length > 0,
+        requested: useRagBool,
+        used: useRagBool && retrievedDocs.length > 0,
         error: ragError,
         sourceCount: ragSources.length,
         sources: ragSources,
       },
-    });
+    });*/
   } catch (err) {
     console.error("Error in /api/chat/ask:", err);
-    return res.status(500).json({ error: "Internal server error" });
+    if (!res.writableEnded) {
+      streamError(500, "INTERNAL_SERVER_ERROR", "Internal server error");
+    }
   }
 }
