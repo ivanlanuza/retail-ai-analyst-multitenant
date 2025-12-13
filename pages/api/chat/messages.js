@@ -31,7 +31,7 @@ export default async function handler(req, res) {
     }
 
     const [messages] = await db.query(
-      "SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
+      "SELECT id, role, content, answer_payload, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
       [conversationId]
     );
 
