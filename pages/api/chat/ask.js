@@ -5,6 +5,8 @@ import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 import { getSchemaText } from "../../../lib/sqlDb";
 import { getVectorStore } from "../../../lib/qdrantStore"; // <-- RAG
+import { z } from "zod";
+import Papa from "papaparse";
 
 const MODEL_NAME = "gpt-4o-mini";
 
@@ -15,6 +17,80 @@ const llm = new ChatOpenAI({
 
 const SUMMARY_MESSAGE_INTERVAL = 12; // summarize every 12 messages
 const MIN_MESSAGES_FOR_SUMMARY = 6; // minimum before summarizing
+
+// ===== Phase 4: AnswerPayload + CSV export =====
+const MAX_TABLE_ROWS_IN_RESPONSE = 20; // must match prompt rule unless user asks otherwise
+const CSV_EXPORT_ROW_THRESHOLD = 200; // when >= this, include csv export payload
+
+const TableSchema = z.object({
+  columns: z.array(z.string()),
+  rows: z.array(z.any()),
+  rowCount: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+});
+
+const DownloadSchema = z
+  .object({
+    kind: z.literal("csv"),
+    filename: z.string(),
+    mimeType: z.literal("text/csv"),
+    content: z.string(), // raw CSV string
+  })
+  .passthrough();
+
+const AnswerPayloadSchema = z
+  .object({
+    version: z.literal("v1"),
+    status: z.enum(["complete", "non_data", "error"]),
+    answerText: z.string(),
+    table: TableSchema.optional().nullable(),
+    downloads: z.array(DownloadSchema).optional().nullable(),
+    meta: z
+      .object({
+        sql: z.string().optional().nullable(),
+        sqlQueryId: z.number().int().optional().nullable(),
+        tokens: z
+          .object({
+            model: z.string(),
+            input: z.number(),
+            output: z.number(),
+            total: z.number(),
+          })
+          .optional()
+          .nullable(),
+        rag: z
+          .object({
+            requested: z.boolean(),
+            used: z.boolean(),
+            error: z.string().nullable(),
+            sourceCount: z.number().int().nonnegative(),
+            sources: z.array(z.any()),
+          })
+          .optional()
+          .nullable(),
+      })
+      .optional()
+      .nullable(),
+  })
+  .passthrough();
+
+function safeJsonParse(text) {
+  if (!text || typeof text !== "string") return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  // strip common fenced blocks
+  const cleaned = trimmed
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Safely convert ChatOpenAI message content to a string
@@ -348,7 +424,39 @@ export default async function handler(req, res) {
         [convId]
       );
 
+      // Phase 4: answerPayload for non-data
+      const answerPayload = {
+        version: "v1",
+        status: "non_data",
+        answerText: acknowledgment,
+        table: {
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          truncated: false,
+        },
+        downloads: [],
+        meta: {
+          sql: null,
+          sqlQueryId: null,
+          tokens: {
+            model: MODEL_NAME,
+            input: 0,
+            output: 0,
+            total: 0,
+          },
+          rag: {
+            requested: false,
+            used: false,
+            error: null,
+            sourceCount: 0,
+            sources: [],
+          },
+        },
+      };
+
       return res.status(200).json({
+        answerPayload,
         conversationId: convId,
         messages,
         status: "non_data",
@@ -491,7 +599,7 @@ export default async function handler(req, res) {
           "You can ONLY generate a single SQL SELECT query.",
           "Never modify data (no INSERT, UPDATE, DELETE, DROP, CREATE, ALTER).",
           "All amounts are in Philippine Pesos (PHP).",
-          "Always use LIMIT 500 unless the user explicitly asks for a different limit.",
+          `Always use LIMIT ${MAX_TABLE_ROWS_IN_RESPONSE} unless the user explicitly asks for a different limit.`,
           "If they ask for 'top N', use ORDER BY on a relevant column and LIMIT N.",
           "",
           "You have the following database schema:",
@@ -592,7 +700,7 @@ export default async function handler(req, res) {
     }
 
     // 7) Generate short text answer based on rows
-    const sampleRows = rows.slice(0, 20);
+    const sampleRows = rows.slice(0, 50);
 
     const answerPrompt = ChatPromptTemplate.fromMessages([
       [
@@ -602,6 +710,12 @@ export default async function handler(req, res) {
           "Given the user's question, the SQL query that was run, and the resulting rows,",
           "produce a short, clear answer (1–3 sentences) in plain English.",
           "For currency figures, always use Philippine Peso (₱).",
+          "",
+          "Return STRICT JSON ONLY with this shape:",
+          "Use keys: answerText (string).",
+          "",
+          "Do NOT include SQL in the answerText.",
+          "Do NOT include markdown fences.",
         ].join(" "),
       ],
       [
@@ -613,10 +727,13 @@ export default async function handler(req, res) {
           "SQL executed:",
           "{sql}",
           "",
+          "Columns:",
+          "{columnsJson}",
+          "",
           "First rows (JSON):",
           "{rowsJson}",
           "",
-          "Now write a short answer for the user. Do NOT repeat the SQL.",
+          "Now respond with strict JSON only.",
         ].join("\n"),
       ],
     ]);
@@ -624,17 +741,29 @@ export default async function handler(req, res) {
     const answerMessages = await answerPrompt.formatMessages({
       question,
       sql,
+      columnsJson: JSON.stringify(fields.map((f) => f.name)),
       rowsJson: JSON.stringify(sampleRows),
     });
 
     const answerMsg = await llm.invoke(answerMessages);
-    const answerText = contentToString(answerMsg.content).trim();
+    const answerObj = safeJsonParse(contentToString(answerMsg.content));
 
     const answerUsage = answerMsg.usage_metadata || {
       input_tokens: 0,
       output_tokens: 0,
       total_tokens: 0,
     };
+
+    let answerText = "";
+
+    if (answerObj && typeof answerObj === "object") {
+      answerText = String(answerObj.answerText || "").trim();
+    }
+
+    if (!answerText) {
+      // Fallback: preserve prior behavior if JSON parse fails
+      answerText = contentToString(answerMsg.content).trim();
+    }
 
     const totalInputTokens =
       (sqlUsage.input_tokens || 0) + (answerUsage.input_tokens || 0);
@@ -756,6 +885,28 @@ export default async function handler(req, res) {
 
     const columns = fields.map((f) => f.name);
 
+    // Phase 4: table + export handling
+    const fullRowCount = Array.isArray(rows) ? rows.length : 0;
+    const tableTruncated = fullRowCount > MAX_TABLE_ROWS_IN_RESPONSE;
+    const tableRowsForUi = tableTruncated
+      ? rows.slice(0, MAX_TABLE_ROWS_IN_RESPONSE)
+      : rows;
+
+    const downloads = [];
+    try {
+      if (fullRowCount >= CSV_EXPORT_ROW_THRESHOLD && Array.isArray(rows)) {
+        const csv = Papa.unparse(rows, { skipEmptyLines: true });
+        downloads.push({
+          kind: "csv",
+          filename: `export-${convId}-${Date.now()}.csv`,
+          mimeType: "text/csv",
+          content: csv,
+        });
+      }
+    } catch (csvErr) {
+      console.error("CSV export build error:", csvErr);
+    }
+
     // Shape RAG sources for frontend (for “Source materials” accordion)
     const ragSources = retrievedDocs.map((d, idx) => {
       const meta = d.metadata || {};
@@ -776,7 +927,47 @@ export default async function handler(req, res) {
       };
     });
 
+    const answerPayload = {
+      version: "v1",
+      status: "complete",
+      answerText,
+      table: {
+        columns,
+        rows: tableRowsForUi,
+        rowCount: fullRowCount,
+        truncated: tableTruncated,
+      },
+      downloads,
+      meta: {
+        sql,
+        sqlQueryId,
+        tokens: {
+          model: MODEL_NAME,
+          input: totalInputTokens,
+          output: totalOutputTokens,
+          total: totalTokens,
+        },
+        rag: {
+          requested: !!useRag,
+          used: !!useRag && retrievedDocs.length > 0,
+          error: ragError,
+          sourceCount: ragSources.length,
+          sources: ragSources,
+        },
+      },
+    };
+
+    // Best-effort validation; do not crash the request if schema mismatches
+    try {
+      AnswerPayloadSchema.parse(answerPayload);
+    } catch (apErr) {
+      console.error("AnswerPayload validation failed (non-fatal):", apErr);
+    }
+
+    console.log(answerPayload);
+
     return res.status(200).json({
+      answerPayload,
       conversationId: convId,
       messages,
       status: "complete",
@@ -784,7 +975,7 @@ export default async function handler(req, res) {
       sql,
       table: {
         columns,
-        rows,
+        rows: tableRowsForUi,
       },
       tokens: {
         model: MODEL_NAME,

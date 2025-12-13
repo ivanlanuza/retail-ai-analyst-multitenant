@@ -3,7 +3,10 @@ import { Geist, Geist_Mono } from "next/font/google";
 import { useEffect, useState, useRef } from "react";
 import { getUserFromRequest } from "../lib/auth";
 import { Button } from "@/components/ui/button";
-import { Settings } from "lucide-react";
+import { Settings, Download } from "lucide-react";
+import { saveAs } from "file-saver";
+
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 
@@ -16,6 +19,140 @@ const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
 });
+
+// ===== Phase 4: AnswerPayload helpers =====
+function getAnswerPayloadFromApiResponse(data) {
+  // Prefer the new payload if present; fall back to legacy fields.
+  if (data && data.answerPayload) return data.answerPayload;
+  const legacyTable = data?.table || null;
+  return {
+    version: "v1",
+    status: data?.status || "complete",
+    answerText: data?.answer || "",
+    table: legacyTable
+      ? {
+          columns: Array.isArray(legacyTable.columns)
+            ? legacyTable.columns
+            : [],
+          rows: Array.isArray(legacyTable.rows) ? legacyTable.rows : [],
+          rowCount: Array.isArray(legacyTable.rows)
+            ? legacyTable.rows.length
+            : 0,
+          truncated: false,
+        }
+      : {
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          truncated: false,
+        },
+
+    downloads: [],
+    meta: {
+      sql: data?.sql || null,
+      sqlQueryId: data?.sqlQueryId || null,
+      tokens: data?.tokens || null,
+      rag: data?.rag || null,
+    },
+  };
+}
+
+function downloadCsvFromPayload(payload) {
+  const dl = payload?.downloads?.find(
+    (d) => d && d.kind === "csv" && typeof d.content === "string"
+  );
+  if (!dl) return;
+  try {
+    const blob = new Blob([dl.content], { type: dl.mimeType || "text/csv" });
+    saveAs(blob, dl.filename || "export.csv");
+  } catch (err) {
+    console.error("CSV download failed:", err);
+  }
+}
+
+function VirtualTable({ columns, rows, maxHeight = 420 }) {
+  const parentRef = useRef(null);
+  const rowVirtualizer = useVirtualizer({
+    count: rows.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 28,
+    overscan: 12,
+  });
+
+  const virtualItems = rowVirtualizer.getVirtualItems();
+  const totalSize = rowVirtualizer.getTotalSize();
+
+  return (
+    <div
+      ref={parentRef}
+      className="overflow-auto rounded-md border border-neutral-200 bg-white"
+      style={{ maxHeight }}
+    >
+      <table className="min-w-full border-collapse text-[11px]">
+        <thead className="sticky top-0 z-10 bg-neutral-50">
+          <tr>
+            {columns.map((col) => (
+              <th
+                key={col}
+                className="px-2 py-1 text-left font-medium text-neutral-700"
+              >
+                {col}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td
+              colSpan={columns.length}
+              style={{ height: totalSize, padding: 0, border: "none" }}
+            >
+              <div style={{ position: "relative", height: totalSize }}>
+                {virtualItems.map((vi) => {
+                  const row = rows[vi.index];
+                  return (
+                    <div
+                      key={vi.key}
+                      style={{
+                        position: "absolute",
+                        top: 0,
+                        left: 0,
+                        width: "100%",
+                        transform: `translateY(${vi.start}px)`,
+                      }}
+                    >
+                      <div
+                        className={
+                          vi.index % 2 === 0 ? "bg-white" : "bg-neutral-50"
+                        }
+                      >
+                        <div
+                          className="grid"
+                          style={{
+                            gridTemplateColumns: `repeat(${columns.length}, minmax(140px, 1fr))`,
+                          }}
+                        >
+                          {columns.map((col) => (
+                            <div
+                              key={col}
+                              className="px-2 py-1 whitespace-nowrap font-mono text-[10px] text-neutral-800"
+                            >
+                              {row?.[col] == null ? "" : String(row[col])}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 export default function DashboardPage({ user }) {
   const [conversations, setConversations] = useState([]);
@@ -42,8 +179,10 @@ export default function DashboardPage({ user }) {
   const [activeAnswer, setActiveAnswer] = useState(null);
   const [answerMetaByMessageId, setAnswerMetaByMessageId] = useState({});
   const [activeAnswerMeta, setActiveAnswerMeta] = useState(null);
+  const [activeAnswerPayload, setActiveAnswerPayload] = useState(null);
   const [showAdvancedStats, setShowAdvancedStats] = useState(false);
   const [useRag, setUseRag] = useState(true);
+  const [showInlineVisuals, setShowInlineVisuals] = useState(true);
   // User memory editor state
   const [userMemorySummary, setUserMemorySummary] = useState("");
   const [loadingUserMemory, setLoadingUserMemory] = useState(false);
@@ -239,6 +378,7 @@ export default function DashboardPage({ user }) {
     setSelectedConversationId(id);
     setAnswerMetaByMessageId({});
     setActiveAnswerMeta(null);
+    setActiveAnswerPayload(null);
     fetchMessages(id);
     fetchStats(id);
   }
@@ -250,6 +390,7 @@ export default function DashboardPage({ user }) {
     setStats({ sqlQueries: [], tokenUsage: [] });
     setAnswerMetaByMessageId({});
     setActiveAnswerMeta(null);
+    setActiveAnswerPayload(null);
     setUseRag(true);
   }
 
@@ -275,6 +416,7 @@ export default function DashboardPage({ user }) {
         setSending(false);
         return;
       }
+      console.log("Ask response data:", data);
 
       // Update state with returned conversation + messages
       setSelectedConversationId(data.conversationId);
@@ -282,29 +424,41 @@ export default function DashboardPage({ user }) {
       setMessages(msgs);
       setQuestion("");
 
-      // Store Phase 1 answer meta for the latest assistant message, keyed by message id
-      if (
-        data &&
-        data.conversationId &&
-        (data.sql || data.table || data.tokens)
-      ) {
+      // Store answer payload + meta for the latest assistant message, keyed by message id
+      if (data && data.conversationId) {
         const latestAssistant = [...msgs]
           .reverse()
           .find((m) => m.role === "assistant");
         if (latestAssistant) {
-          const meta = {
-            conversationId: data.conversationId,
+          const payload = getAnswerPayloadFromApiResponse(data);
+          const meta = payload?.meta || {
             sql: data.sql || null,
             table: data.table || null,
             tokens: data.tokens || null,
             rag: data.rag || null,
           };
+
           setAnswerMetaByMessageId((prev) => ({
             ...prev,
-            [latestAssistant.id]: meta,
+            [latestAssistant.id]: {
+              conversationId: data.conversationId,
+              sql: meta.sql ?? data.sql ?? null,
+              table: payload?.table ?? data.table ?? null,
+              tokens: meta.tokens ?? data.tokens ?? null,
+              rag: meta.rag ?? data.rag ?? null,
+              answerPayload: payload,
+            },
           }));
-          // also set as the currently active meta so it's immediately available
-          setActiveAnswerMeta(meta);
+
+          setActiveAnswerMeta({
+            conversationId: data.conversationId,
+            sql: meta.sql ?? data.sql ?? null,
+            table: payload?.table ?? data.table ?? null,
+            tokens: meta.tokens ?? data.tokens ?? null,
+            rag: meta.rag ?? data.rag ?? null,
+          });
+
+          setActiveAnswerPayload(payload);
         }
       }
 
@@ -326,6 +480,7 @@ export default function DashboardPage({ user }) {
     // if we don't have per-message meta yet (e.g., older answers),
     // keep whatever active meta we already have as a fallback
     setActiveAnswerMeta((prev) => meta || prev);
+    setActiveAnswerPayload((prev) => meta?.answerPayload || prev);
     // ensure latest stats for this conversation
     fetchStats(selectedConversationId);
     setIsStatsModalOpen(true);
@@ -335,6 +490,7 @@ export default function DashboardPage({ user }) {
     setIsStatsModalOpen(false);
     setActiveAnswer(null);
     setShowAdvancedStats(false);
+    setActiveAnswerPayload(null);
   }
 
   const hasConversations = conversations.length > 0;
@@ -461,15 +617,15 @@ export default function DashboardPage({ user }) {
         {isChatStarted ? (
           <section className="flex flex-1 min-h-0 flex-col gap-3">
             {/* Chat area */}
-            <Card className="flex min-h-[320px] flex-1 min-h-0 flex-col border-neutral-200 bg-white shadow-sm">
+            <Card className="flex flex-1 flex-col  bg-neutral-100 border-none shadow-none">
               <CardHeader className="border-b border-neutral-100 pb-2">
                 <CardTitle className="text-sm font-medium text-neutral-800">
-                  Ask a question
+                  {/*Ask a question*/}
                 </CardTitle>
               </CardHeader>
               <CardContent className="flex flex-1 min-h-0 flex-col p-0">
                 {/* Messages */}
-                <div className="flex-1 min-h-0 space-y-2 overflow-y-auto p-3 text-sm">
+                <div className="flex-1 min-h-0 space-y-4 overflow-y-auto p-3 text-sm">
                   {loadingMessages && (
                     <p className="text-xs text-neutral-500">
                       Loading messages…
@@ -490,20 +646,129 @@ export default function DashboardPage({ user }) {
                           isUser ? "justify-end" : "justify-start"
                         }`}
                       >
-                        <div
-                          className={`max-w-[75%] rounded-md px-3 py-2 text-xs leading-relaxed ${
-                            isUser
-                              ? "bg-neutral-400 text-neutral-50"
-                              : "bg-neutral-100 text-neutral-800 cursor-pointer hover:bg-neutral-200"
-                          }`}
-                          onClick={
-                            isUser
-                              ? undefined
-                              : () => handleOpenStatsForMessage(msg)
-                          }
-                        >
-                          {msg.content}
-                        </div>
+                        {isUser ? (
+                          <div className="max-w-[75%] rounded-md bg-neutral-400 px-3 py-2 text-xs leading-relaxed text-neutral-50">
+                            {msg.content}
+                          </div>
+                        ) : (
+                          <div className="w-full max-w-[75%] mb-3">
+                            {/* Answer bubble */}
+                            <div
+                              className="rounded-md border border-neutral-200 bg-white px-3 py-2 text-xs leading-relaxed text-neutral-800 cursor-pointer hover:bg-neutral-50"
+                              onClick={() => handleOpenStatsForMessage(msg)}
+                            >
+                              {msg.content}
+                            </div>
+
+                            {/* Inline BI rendering (stacked) */}
+                            {(() => {
+                              const payload =
+                                answerMetaByMessageId?.[msg.id]?.answerPayload;
+                              const table = payload?.table;
+                              const columns = table?.columns || [];
+                              const rows = table?.rows || [];
+                              const hasTable =
+                                rows.length > 0 && columns.length > 0;
+
+                              if (!payload) return null;
+                              if (!showInlineVisuals) return null;
+
+                              if (hasTable) {
+                                return (
+                                  <div className="mt-2 rounded-md border border-neutral-200 bg-white">
+                                    <div className="flex items-center justify-between border-b border-neutral-100 px-3 py-2">
+                                      <div className="text-[11px] font-semibold text-neutral-800">
+                                        Results
+                                      </div>
+                                      <div className="flex items-center gap-2">
+                                        {table?.truncated ? (
+                                          <span className="rounded-sm bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800">
+                                            Preview truncated
+                                          </span>
+                                        ) : null}
+
+                                        {payload?.downloads?.some(
+                                          (d) => d?.kind === "csv"
+                                        ) ? (
+                                          <Button
+                                            type="button"
+                                            size="sm"
+                                            variant="outline"
+                                            className="h-7 border-neutral-300 text-neutral-700 hover:bg-neutral-100"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              downloadCsvFromPayload(payload);
+                                            }}
+                                          >
+                                            <Download className="mr-1 h-3.5 w-3.5" />
+                                            CSV
+                                          </Button>
+                                        ) : null}
+                                      </div>
+                                    </div>
+
+                                    {rows.length > 100 ? (
+                                      <VirtualTable
+                                        columns={columns}
+                                        rows={rows}
+                                        maxHeight={320}
+                                      />
+                                    ) : (
+                                      <div className="max-h-80 overflow-auto">
+                                        <table className="min-w-full border-collapse text-[11px]">
+                                          <thead className="sticky top-0 z-10 bg-neutral-50">
+                                            <tr>
+                                              {columns.map((col) => (
+                                                <th
+                                                  key={col}
+                                                  className="px-2 py-1 text-left font-medium text-neutral-700"
+                                                >
+                                                  {col}
+                                                </th>
+                                              ))}
+                                            </tr>
+                                          </thead>
+                                          <tbody>
+                                            {rows.map((row, idx) => (
+                                              <tr
+                                                key={idx}
+                                                className={
+                                                  idx % 2 === 0
+                                                    ? "bg-white"
+                                                    : "bg-neutral-50"
+                                                }
+                                              >
+                                                {columns.map((col) => (
+                                                  <td
+                                                    key={col}
+                                                    className="px-2 py-1 whitespace-nowrap font-mono text-[10px] text-neutral-800"
+                                                  >
+                                                    {row?.[col] == null
+                                                      ? ""
+                                                      : String(row[col])}
+                                                  </td>
+                                                ))}
+                                              </tr>
+                                            ))}
+                                          </tbody>
+                                        </table>
+                                      </div>
+                                    )}
+
+                                    <div className="border-t border-neutral-100 px-3 py-2 text-[10px] text-neutral-600">
+                                      Rows returned:{" "}
+                                      {table?.rowCount?.toLocaleString?.() ||
+                                        table?.rowCount ||
+                                        rows.length}
+                                    </div>
+                                  </div>
+                                );
+                              }
+
+                              return null;
+                            })()}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -599,6 +864,27 @@ export default function DashboardPage({ user }) {
                     className="h-3 w-3"
                     checked={useRag}
                     onChange={(e) => setUseRag(e.target.checked)}
+                  />
+                  <span>Enabled</span>
+                </label>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-[11px] font-semibold text-neutral-800">
+                    Show tables inline
+                  </div>
+                  <div className="text-[11px] text-neutral-600">
+                    When enabled, query result tables appear directly under each
+                    AI answer.
+                  </div>
+                </div>
+                <label className="ml-4 inline-flex items-center gap-2 text-[11px] text-neutral-700">
+                  <input
+                    type="checkbox"
+                    className="h-3 w-3"
+                    checked={showInlineVisuals}
+                    onChange={(e) => setShowInlineVisuals(e.target.checked)}
                   />
                   <span>Enabled</span>
                 </label>
@@ -782,7 +1068,7 @@ export default function DashboardPage({ user }) {
       {/* Stats modal */}
       {isStatsModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-          <div className="w-full max-w-2xl rounded-lg border border-neutral-200 bg-white shadow-lg">
+          <div className="w-full max-w-2xl max-h-[85vh] overflow-hidden rounded-lg border border-neutral-200 bg-white shadow-lg">
             <div className="flex items-center justify-between border-b border-neutral-100 px-4 py-3">
               <div>
                 <h2 className="text-sm font-medium text-neutral-900">
@@ -805,7 +1091,10 @@ export default function DashboardPage({ user }) {
               </Button>
             </div>
 
-            <div className="space-y-4 px-4 py-3 text-xs">
+            <div
+              className="space-y-4 px-4 py-3 text-xs overflow-y-auto"
+              style={{ maxHeight: "calc(85vh - 56px)" }}
+            >
               {!selectedConversationId ? (
                 <p className="text-neutral-500">
                   No conversation selected. Close this and pick a conversation.
@@ -835,6 +1124,46 @@ export default function DashboardPage({ user }) {
                           {activeAnswerMeta.tokens.total}
                         </div>
                       )}
+                      {activeAnswerPayload?.table && (
+                        <div className="text-[11px] text-neutral-700">
+                          Rows returned:{" "}
+                          {activeAnswerPayload.table.rowCount?.toLocaleString?.() ||
+                            activeAnswerPayload.table.rowCount ||
+                            0}
+                          {activeAnswerPayload.table.truncated ? (
+                            <span className="ml-2 rounded-sm bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800">
+                              Preview truncated
+                            </span>
+                          ) : null}
+                        </div>
+                      )}
+
+                      {activeAnswerPayload?.downloads?.some(
+                        (d) => d?.kind === "csv"
+                      ) && (
+                        <div className="flex items-center justify-between rounded-md border border-neutral-200 bg-white px-3 py-2">
+                          <div>
+                            <div className="text-[11px] font-semibold text-neutral-800">
+                              Download
+                            </div>
+                            <div className="text-[10px] text-neutral-600">
+                              Export the full result set as CSV.
+                            </div>
+                          </div>
+                          <Button
+                            type="button"
+                            size="sm"
+                            className="bg-neutral-900 text-neutral-50 hover:bg-neutral-800"
+                            onClick={() =>
+                              downloadCsvFromPayload(activeAnswerPayload)
+                            }
+                          >
+                            <Download className="mr-1 h-3.5 w-3.5" />
+                            CSV
+                          </Button>
+                        </div>
+                      )}
+
                       {activeAnswerMeta.rag &&
                         activeAnswerMeta.rag.used &&
                         activeAnswerMeta.rag.sources &&
@@ -884,49 +1213,61 @@ export default function DashboardPage({ user }) {
                               Result preview for this answer (
                               {activeAnswerMeta.table.rows.length} rows)
                             </div>
-                            <div className="max-h-40 overflow-auto rounded-md border border-neutral-200 bg-white">
-                              <table className="min-w-full border-collapse text-[11px]">
-                                <thead className="bg-neutral-50">
-                                  <tr>
-                                    {activeAnswerMeta.table.columns.map(
-                                      (col) => (
-                                        <th
-                                          key={col}
-                                          className="px-2 py-1 text-left font-medium text-neutral-700"
+                            {(() => {
+                              const cols = activeAnswerMeta.table.columns || [];
+                              const rws = activeAnswerMeta.table.rows || [];
+                              const useVirtual = rws.length > 100;
+
+                              if (useVirtual) {
+                                return (
+                                  <VirtualTable
+                                    columns={cols}
+                                    rows={rws}
+                                    maxHeight={240}
+                                  />
+                                );
+                              }
+
+                              return (
+                                <div className="max-h-40 overflow-auto rounded-md border border-neutral-200 bg-white">
+                                  <table className="min-w-full border-collapse text-[11px]">
+                                    <thead className="bg-neutral-50">
+                                      <tr>
+                                        {cols.map((col) => (
+                                          <th
+                                            key={col}
+                                            className="px-2 py-1 text-left font-medium text-neutral-700"
+                                          >
+                                            {col}
+                                          </th>
+                                        ))}
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {rws.map((row, idx) => (
+                                        <tr
+                                          key={idx}
+                                          className={
+                                            idx % 2 === 0
+                                              ? "bg-white"
+                                              : "bg-neutral-50"
+                                          }
                                         >
-                                          {col}
-                                        </th>
-                                      )
-                                    )}
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {activeAnswerMeta.table.rows.map(
-                                    (row, idx) => (
-                                      <tr
-                                        key={idx}
-                                        className={
-                                          idx % 2 === 0
-                                            ? "bg-white"
-                                            : "bg-neutral-50"
-                                        }
-                                      >
-                                        {activeAnswerMeta.table.columns.map(
-                                          (col) => (
+                                          {cols.map((col) => (
                                             <td
                                               key={col}
                                               className="px-2 py-1 whitespace-nowrap font-mono text-[10px] text-neutral-800"
                                             >
                                               {row[col]}
                                             </td>
-                                          )
-                                        )}
-                                      </tr>
-                                    )
-                                  )}
-                                </tbody>
-                              </table>
-                            </div>
+                                          ))}
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              );
+                            })()}
                           </div>
                         )}
                     </div>
