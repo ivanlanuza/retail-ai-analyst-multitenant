@@ -353,6 +353,34 @@ export default async function handler(req, res) {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   }
 
+  function clampPercent(raw) {
+    const n = typeof raw === "number" ? raw : Number(raw);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(0, Math.min(100, n));
+  }
+
+  function emitProgress(progress) {
+    const pct = clampPercent(progress);
+    if (pct == null) return;
+    emit("progress", { progress: pct });
+  }
+
+  function emitStatus(message, progress = null) {
+    const payload = { message };
+
+    const pct = progress == null ? null : clampPercent(progress);
+    if (pct != null) {
+      payload.progress = pct;
+    }
+
+    emit("status", payload);
+
+    // Also emit a dedicated progress event for UIs that prefer it.
+    if (pct != null) {
+      emitProgress(pct);
+    }
+  }
+
   function closeWith(event, payload, statusCode = 200) {
     res.statusCode = statusCode;
     emit(event, payload);
@@ -375,7 +403,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  emit("status", { message: "Starting analysis…" });
+  emitStatus("Starting analysis…", 2);
 
   const { conversationId, question, useRag } =
     req.method === "POST" ? req.body : req.query;
@@ -427,7 +455,7 @@ export default async function handler(req, res) {
     );
 
     const userMessageId = userMsgResult.insertId;
-    emit("status", { message: "Understanding your question…" });
+    emitStatus("Understanding your question…", 8);
 
     // ---------------------------------
     // 3) Quick classification: data vs non-data
@@ -441,11 +469,10 @@ export default async function handler(req, res) {
       isDataRequest = true; // permissive fallback
     }
 
-    emit("status", {
-      message: isDataRequest
-        ? "Preparing to query your data…"
-        : "Preparing response…",
-    });
+    emitStatus(
+      isDataRequest ? "Preparing to query your data…" : "Preparing response…",
+      isDataRequest ? 15 : 20
+    );
 
     // ---------------------------------
     // 4) Non-data path (no DB query)
@@ -454,6 +481,7 @@ export default async function handler(req, res) {
     if (!isDataRequest) {
       let acknowledgment;
       try {
+        emitStatus("Drafting response…", 60);
         acknowledgment = await buildNonDataResponse(question);
       } catch (ndErr) {
         console.error("Error building non-data response:", ndErr);
@@ -493,6 +521,7 @@ export default async function handler(req, res) {
         },
       };
 
+      emitStatus("Finalizing response…", 90);
       // Store assistant message
       const assistantMsgResult = await query(
         `INSERT INTO messages
@@ -522,6 +551,7 @@ export default async function handler(req, res) {
         [convId]
       );
 
+      emitStatus("Done.", 100);
       closeWith("final", {
         conversationId: convId,
         messages,
@@ -535,7 +565,7 @@ export default async function handler(req, res) {
     // 5) Data path: gather context
     // ---------------------------------
 
-    emit("status", { message: "Gathering user context…" });
+    emitStatus("Gathering user context…", 25);
 
     // 5.1 conversation summary
     let conversationSummaryForPrompt = "";
@@ -570,7 +600,7 @@ export default async function handler(req, res) {
       console.error("Error building recent Q&A context:", qaErr);
     }
 
-    emit("status", { message: "Getting Business Context..." });
+    emitStatus("Getting Business Context...", 35);
 
     // 5.4 RAG context (optional)
     let retrievedDocs = [];
@@ -642,7 +672,7 @@ export default async function handler(req, res) {
     // 6) NL → SQL
     // ---------------------------------
 
-    emit("status", { message: "Generating SQL query…" });
+    emitStatus("Generating SQL query…", 50);
 
     const schemaText = await getSchemaText();
 
@@ -704,7 +734,7 @@ export default async function handler(req, res) {
     // 7) Execute SQL
     // ---------------------------------
 
-    emit("status", { message: "Running query on database…" });
+    emitStatus("Running query on database…", 65);
 
     let rows = [];
     let fields = [];
@@ -767,7 +797,7 @@ export default async function handler(req, res) {
     // 8) Summarize results into answerText
     // ---------------------------------
 
-    emit("status", { message: "Summarizing results…" });
+    emitStatus("Summarizing results…", 80);
 
     const sampleRows = rows.slice(0, 50);
 
@@ -995,6 +1025,8 @@ export default async function handler(req, res) {
       },
     };
 
+    emitStatus("Finalizing response…", 92);
+
     // ---------------------------------
     // 12) Persist assistant message + token usage
     // ---------------------------------
@@ -1053,6 +1085,7 @@ export default async function handler(req, res) {
     // 14) Final SSE response (UI contract)
     // ---------------------------------
 
+    emitStatus("Done.", 100);
     closeWith("final", {
       conversationId: convId,
       messages,
