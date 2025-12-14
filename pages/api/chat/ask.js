@@ -16,7 +16,9 @@ import Papa from "papaparse";
 // Model + behavior constants
 // -----------------------------
 
-const MODEL_NAME = "gpt-4o-mini";
+//const MODEL_NAME = "gpt-4o-mini";
+const MODEL_NAME = "gpt-4.1-mini";
+
 const llm = new ChatOpenAI({ model: MODEL_NAME, temperature: 0 });
 
 const SUMMARY_MESSAGE_INTERVAL = 12; // summarize every 12 messages
@@ -46,6 +48,15 @@ const DownloadSchema = z
   })
   .passthrough();
 
+const ChartSchema = z
+  .object({
+    type: z.literal("basicareachart"),
+    xKey: z.string(),
+    yKey: z.string(),
+    data: z.array(z.record(z.any())),
+  })
+  .passthrough();
+
 const AnswerPayloadSchema = z
   .object({
     version: z.literal("v1"),
@@ -53,6 +64,7 @@ const AnswerPayloadSchema = z
     answerText: z.string(),
     table: TableSchema.optional().nullable(),
     downloads: z.array(DownloadSchema).optional().nullable(),
+    chart: ChartSchema.optional().nullable(),
     meta: z
       .object({
         sql: z.string().optional().nullable(),
@@ -121,6 +133,246 @@ function contentToString(content) {
   }
 
   return String(content ?? "");
+}
+
+// -----------------------------
+// Basic chart inference helpers
+// -----------------------------
+
+const MAX_CHART_POINTS = 200;
+
+function isPlainObject(v) {
+  return v && typeof v === "object" && !Array.isArray(v);
+}
+
+function clampArray(arr, max) {
+  if (!Array.isArray(arr)) return [];
+  if (arr.length <= max) return arr;
+  return arr.slice(0, max);
+}
+
+function detectYearMonthKey(columns) {
+  if (!Array.isArray(columns) || columns.length === 0) return null;
+
+  //console.log(columns);
+  // Prefer the fully-qualified name if it is returned by the driver.
+  if (columns.includes("metrics.yearmonth")) return "metrics.yearmonth";
+
+  // Most MySQL drivers return the column name without the table prefix.
+  if (columns.includes("yearmonth")) return "yearmonth";
+
+  if (columns.includes("Month-Year")) return "Month-Year";
+  if (columns.includes("Month")) return "Month";
+
+  return null;
+}
+
+function normalizeXAxisValue(value) {
+  if (value == null) return null;
+
+  // mysql2 may return Date objects; stringify in a stable way
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+
+  const s = String(value).trim();
+  if (!s) return null;
+  return s;
+}
+
+function compareYearMonth(a, b) {
+  // Works for common formats like YYYY-MM, YYYYMM, YYYY-MM-DD, ISO, etc.
+  // We keep it simple: lexicographic compare is stable for year-first strings.
+  return String(a || "").localeCompare(String(b || ""));
+}
+
+function getNumericCandidateKeys(columns, rows, excludeKey) {
+  if (!Array.isArray(columns) || columns.length === 0) return [];
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+
+  const sample = clampArray(rows, 50);
+
+  const candidates = [];
+
+  for (const col of columns) {
+    const key = String(col || "");
+    if (!key) continue;
+    if (excludeKey && key === excludeKey) continue;
+
+    let nonNull = 0;
+    let numeric = 0;
+
+    for (const r of sample) {
+      if (!isPlainObject(r)) continue;
+      const v = r[key];
+      if (v == null || v === "") continue;
+      nonNull += 1;
+
+      if (typeof v === "number" && Number.isFinite(v)) {
+        numeric += 1;
+        continue;
+      }
+
+      if (typeof v === "string") {
+        const t = v.trim();
+        if (!t) continue;
+        const n = Number(t.replace(/,/g, ""));
+        if (Number.isFinite(n)) numeric += 1;
+      }
+    }
+
+    if (nonNull === 0) continue;
+
+    const ratio = numeric / nonNull;
+    if (ratio >= 0.6) candidates.push(key);
+  }
+
+  return candidates;
+}
+
+function pickMetricHeuristic(candidateKeys) {
+  if (!Array.isArray(candidateKeys) || candidateKeys.length === 0) return null;
+  if (candidateKeys.length === 1) return candidateKeys[0];
+
+  const priorities = [
+    /revenue|sales|amount|total|gross|net|profit/i,
+    /count|transactions|orders|qty|quantity|units/i,
+    /points|visits|members|customers/i,
+  ];
+
+  for (const re of priorities) {
+    const hit = candidateKeys.find((k) => re.test(String(k)));
+    if (hit) return hit;
+  }
+
+  // fallback: first candidate
+  return candidateKeys[0];
+}
+
+async function inferMetricKeyWithAI({
+  question,
+  dateKey,
+  numericCandidates,
+  sampleRows,
+}) {
+  if (!Array.isArray(numericCandidates) || numericCandidates.length === 0)
+    return null;
+
+  const prompt = ChatPromptTemplate.fromMessages([
+    [
+      "system",
+      [
+        "You are helping pick the single best metric column to plot as an area chart over time.",
+        "You will be given:",
+        "- The user question",
+        "- A date column (x-axis)",
+        "- A list of numeric candidate columns (y-axis candidates)",
+        "- A small sample of result rows",
+        "Pick the ONE candidate that best answers the user question as a trend over time.",
+        "Return STRICT JSON ONLY as JSON with exactly one key: metricKey (string).",
+        "The metricKey value must be exactly one of the provided candidates.",
+        "Do not include markdown fences.",
+        "Do not include any other keys.",
+      ].join(" "),
+    ],
+    [
+      "human",
+      [
+        "User question:",
+        "{question}",
+        "",
+        "Date key (x-axis): {dateKey}",
+        "Numeric candidates (choose one): {candidatesJson}",
+        "",
+        "Sample rows (JSON):",
+        "{rowsJson}",
+        "",
+        "Now respond with strict JSON only.",
+      ].join("\n"),
+    ],
+  ]);
+
+  const messages = await prompt.formatMessages({
+    question: String(question || ""),
+    dateKey: String(dateKey || ""),
+    candidatesJson: JSON.stringify(numericCandidates),
+    rowsJson: JSON.stringify(clampArray(sampleRows || [], 20)),
+  });
+
+  const resp = await llm.invoke(messages);
+  const obj = safeJsonParse(contentToString(resp.content));
+
+  const metricKey =
+    obj && typeof obj === "object" ? String(obj.metricKey || "").trim() : "";
+  if (!metricKey) return null;
+  if (!numericCandidates.includes(metricKey)) return null;
+  return metricKey;
+}
+
+async function buildBasicAreaChartPayload({ question, columns, rows }) {
+  const dateKey = detectYearMonthKey(columns);
+  if (!dateKey) return null;
+
+  const numericCandidates = getNumericCandidateKeys(columns, rows, dateKey);
+  if (!numericCandidates || numericCandidates.length === 0) return null;
+
+  const sampleRows = clampArray(rows, 50);
+
+  let metricKey = null;
+  try {
+    metricKey = await inferMetricKeyWithAI({
+      question,
+      dateKey,
+      numericCandidates,
+      sampleRows,
+    });
+  } catch (err) {
+    console.error(
+      "Metric inference (AI) failed, falling back to heuristic:",
+      err
+    );
+  }
+
+  if (!metricKey) metricKey = pickMetricHeuristic(numericCandidates);
+  if (!metricKey) return null;
+
+  // Build recharts-friendly data payload:
+  // [{ [dateKey]: <date>, [metricKey]: <number> }, ...]
+  const raw = clampArray(rows, MAX_CHART_POINTS)
+    .map((r) => {
+      if (!isPlainObject(r)) return null;
+
+      const x = normalizeXAxisValue(r[dateKey]);
+      if (!x) return null;
+
+      const v = r[metricKey];
+      if (v == null || v === "") return null;
+
+      let y = v;
+      if (typeof v === "string") {
+        const n = Number(v.trim().replace(/,/g, ""));
+        if (Number.isFinite(n)) y = n;
+      }
+
+      if (typeof y === "number" && !Number.isFinite(y)) return null;
+
+      return { [dateKey]: x, [metricKey]: y };
+    })
+    .filter(Boolean);
+
+  // Sort ascending by yearmonth lexicographically
+  const sorted = raw.slice().sort((a, b) => {
+    return compareYearMonth(a[dateKey], b[dateKey]);
+  });
+
+  if (sorted.length === 0) return null;
+
+  return {
+    type: "basicareachart",
+    xKey: dateKey,
+    yKey: metricKey,
+    data: sorted,
+  };
 }
 
 // -----------------------------
@@ -502,6 +754,7 @@ export default async function handler(req, res) {
           truncated: false,
         },
         downloads: [],
+        chart: null,
         meta: {
           sql: null,
           sqlQueryId: null,
@@ -971,6 +1224,22 @@ export default async function handler(req, res) {
       console.error("CSV export build error:", csvErr);
     }
 
+    // ---------------------------------
+    // 10.5) Optional chart payload (basic area chart)
+    // ---------------------------------
+
+    let chart = null;
+    try {
+      chart = await buildBasicAreaChartPayload({
+        question,
+        columns: fields.map((f) => f.name),
+        rows,
+      });
+    } catch (chartErr) {
+      console.error("Chart payload build failed (non-fatal):", chartErr);
+      chart = null;
+    }
+
     // Shape RAG sources for frontend (for “Source materials” accordion)
     const ragSources = retrievedDocs.map((d, idx) => {
       const meta = d.metadata || {};
@@ -1006,6 +1275,7 @@ export default async function handler(req, res) {
         truncated: tableTruncated,
       },
       downloads,
+      chart,
       meta: {
         sql,
         sqlQueryId,

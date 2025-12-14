@@ -4,6 +4,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Geist, Geist_Mono } from "next/font/google";
 
+import dynamic from "next/dynamic";
+
 import { getUserFromRequest } from "../lib/auth";
 
 import { Button } from "@/components/ui/button";
@@ -15,6 +17,56 @@ import { saveAs } from "file-saver";
 import Papa from "papaparse";
 
 import { useVirtualizer } from "@tanstack/react-virtual";
+
+// -----------------------------
+// Charts (client-only)
+// -----------------------------
+
+// We must load Recharts on the client only. `dynamic()` returns a React component,
+// so we wrap the Recharts module into a single chart component.
+const BasicAreaChartInner = dynamic(
+  () =>
+    import("recharts").then((mod) => {
+      const {
+        ResponsiveContainer,
+        AreaChart,
+        Area,
+        XAxis,
+        YAxis,
+        Tooltip,
+        CartesianGrid,
+      } = mod;
+
+      function Chart({ data, xKey, yKey }) {
+        return (
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart
+              data={data}
+              margin={{ top: 8, right: 12, left: 0, bottom: 0 }}
+            >
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey={xKey} tick={{ fontSize: 10 }} minTickGap={24} />
+              <YAxis tick={{ fontSize: 10 }} width={44} />
+              <Tooltip />
+              <Area
+                type="monotone"
+                dataKey={yKey}
+                stroke="#B71C1C"
+                fill="#FECACA"
+                fillOpacity={0.5}
+                strokeWidth={2}
+                isAnimationActive={false}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        );
+      }
+
+      Chart.displayName = "BasicAreaChartInner";
+      return Chart;
+    }),
+  { ssr: false }
+);
 
 // -----------------------------
 // Fonts
@@ -36,6 +88,42 @@ const geistMono = Geist_Mono({
 
 const STREAMING_MESSAGE_ID = "streaming";
 const TOAST_TIMEOUT_MS = 1200;
+
+// -----------------------------
+// Display formatters
+// -----------------------------
+
+const numberFormatter = new Intl.NumberFormat("en-US", {
+  maximumFractionDigits: 6,
+});
+
+function formatCellValue(value) {
+  if (value == null) return "";
+
+  // Format numbers
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return numberFormatter.format(value);
+  }
+
+  // Format numeric strings (e.g., "12345.67" or "12,345.67")
+  if (typeof value === "string") {
+    const t = value.trim();
+    if (t) {
+      const maybe = Number(t.replace(/,/g, ""));
+      if (Number.isFinite(maybe)) {
+        return numberFormatter.format(maybe);
+      }
+    }
+    return t;
+  }
+
+  // Keep dates readable.
+  if (value instanceof Date && Number.isFinite(value.getTime?.())) {
+    return value.toISOString().slice(0, 10);
+  }
+
+  return String(value);
+}
 
 // -----------------------------
 // AnswerPayload helpers
@@ -74,6 +162,30 @@ function normalizeAnswerPayload(payload) {
     };
   }
 
+  // Normalize optional chart payload
+  if (normalized.chart && typeof normalized.chart === "object") {
+    const chart = normalized.chart;
+
+    // Only one chart type for now
+    if (
+      chart.type === "basicareachart" &&
+      typeof chart.xKey === "string" &&
+      typeof chart.yKey === "string" &&
+      Array.isArray(chart.data)
+    ) {
+      normalized.chart = {
+        type: "basicareachart",
+        xKey: chart.xKey,
+        yKey: chart.yKey,
+        data: chart.data,
+      };
+    } else {
+      normalized.chart = null;
+    }
+  } else if (normalized.chart == null) {
+    normalized.chart = null;
+  }
+
   return normalized;
 }
 
@@ -110,6 +222,7 @@ function getAnswerPayloadFromApiResponse(data) {
             truncated: false,
           },
       downloads: [],
+      chart: null,
       meta: {
         sql: data?.sql || null,
         sqlQueryId: data?.sqlQueryId || null,
@@ -247,7 +360,7 @@ function VirtualTable({ columns, rows, maxHeight = 420 }) {
                               key={col}
                               className="px-2 py-1 whitespace-nowrap font-mono text-[10px] text-neutral-800"
                             >
-                              {row?.[col] == null ? "" : String(row[col])}
+                              {formatCellValue(row?.[col])}
                             </div>
                           ))}
                         </div>
@@ -368,6 +481,7 @@ export default function DashboardPage({ user }) {
   const [hasStartedChat, setHasStartedChat] = useState(false);
   const [streamingProgress, setStreamingProgress] = useState(null);
   const [streamingProgressTarget, setStreamingProgressTarget] = useState(null);
+  const [isClient, setIsClient] = useState(false);
 
   // Auto-scroll
   const messagesEndRef = useRef(null);
@@ -397,7 +511,7 @@ export default function DashboardPage({ user }) {
 
         // Incremental movement (small steps), with gentle acceleration on bigger gaps.
         const gap = target - current;
-        const step = Math.max(0.6, gap * 0.08); // min 0.6% per tick
+        const step = Math.max(0.4, gap * 0.04); // min 0.6% per tick
         const next = Math.min(target, current + step);
 
         if (next >= target) finished = true;
@@ -413,6 +527,11 @@ export default function DashboardPage({ user }) {
   // Initial load + cleanup
   useEffect(() => {
     fetchConversations();
+  }, []);
+
+  // Client-only (avoid SSR issues for chart libs)
+  useEffect(() => {
+    setIsClient(true);
   }, []);
 
   useEffect(() => {
@@ -1228,7 +1347,7 @@ export default function DashboardPage({ user }) {
                         key={col}
                         className="px-2 py-1 whitespace-nowrap font-mono text-[10px] text-neutral-800"
                       >
-                        {row?.[col] == null ? "" : String(row[col])}
+                        {formatCellValue(row?.[col])}
                       </td>
                     ))}
                   </tr>
@@ -1593,9 +1712,9 @@ export default function DashboardPage({ user }) {
                                                     key={col}
                                                     className="px-2 py-1 whitespace-nowrap font-mono text-[10px] text-neutral-800"
                                                   >
-                                                    {row?.[col] == null
-                                                      ? ""
-                                                      : String(row[col])}
+                                                    {formatCellValue(
+                                                      row?.[col]
+                                                    )}
                                                   </td>
                                                 ))}
                                               </tr>
@@ -1616,6 +1735,51 @@ export default function DashboardPage({ user }) {
                               }
 
                               return null;
+                            })()}
+
+                            {/* Inline chart rendering (stacked under Results) */}
+                            {(() => {
+                              const payload =
+                                answerMetaByMessageId?.[msg.id]?.answerPayload;
+
+                              if (!payload) return null;
+                              if (!showInlineVisuals) return null;
+                              if (!isClient) return null;
+
+                              const chart = payload?.chart;
+                              if (!chart || chart.type !== "basicareachart") {
+                                return null;
+                              }
+
+                              const xKey = chart?.xKey;
+                              const yKey = chart?.yKey;
+                              const data = Array.isArray(chart?.data)
+                                ? chart.data
+                                : [];
+
+                              if (!xKey || !yKey || data.length === 0)
+                                return null;
+
+                              return (
+                                <div className="mt-2 rounded-md border border-neutral-200 bg-white">
+                                  <div className="flex items-center justify-between border-b border-neutral-100 px-3 py-2">
+                                    <div className="text-[12px] font-semibold text-neutral-800">
+                                      Trend
+                                    </div>
+                                    <div className="text-[10px] text-neutral-500">
+                                      {yKey} over {xKey}
+                                    </div>
+                                  </div>
+
+                                  <div className="h-56 w-full px-2 py-2">
+                                    <BasicAreaChartInner
+                                      data={data}
+                                      xKey={xKey}
+                                      yKey={yKey}
+                                    />
+                                  </div>
+                                </div>
+                              );
                             })()}
 
                             {/* Answer actions */}
