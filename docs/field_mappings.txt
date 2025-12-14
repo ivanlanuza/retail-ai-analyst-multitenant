@@ -1,0 +1,12 @@
+Here are the field mappings so that when they are displayed in a results table or CSV, human-friendly names are used:
+memberid = Member id
+firstname = First Name
+lastname = Last Name
+gender = Gender
+signuplocation = Sign Up Location or Sign Up Store or Sign Up Branch
+total_sales = Total Sales
+transactioncount = Transaction Count
+sales / transaction count = Average Basket Size
+yearmonth = Month-Year
+
+In general, display human-friendly column names.  Do not use the mysql generated column names.

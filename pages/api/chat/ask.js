@@ -1,26 +1,34 @@
 // pages/api/chat/ask.js
+// Streaming (SSE) chat endpoint: classifies request, optionally retrieves context (RAG/memory),
+// generates SQL, runs it, summarizes results, and returns a stable `answerPayload` for the UI.
+
 import { query, queryWithFields } from "../../../lib/db.mjs";
 import { getUserFromRequest } from "../../../lib/auth";
+import { getSchemaText } from "../../../lib/sqlDb";
+import { getVectorStore } from "../../../lib/qdrantStore"; // RAG
+
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
-import { getSchemaText } from "../../../lib/sqlDb";
-import { getVectorStore } from "../../../lib/qdrantStore"; // <-- RAG
 import { z } from "zod";
 import Papa from "papaparse";
 
-const MODEL_NAME = "gpt-4o-mini";
+// -----------------------------
+// Model + behavior constants
+// -----------------------------
 
-const llm = new ChatOpenAI({
-  model: MODEL_NAME,
-  temperature: 0,
-});
+const MODEL_NAME = "gpt-4o-mini";
+const llm = new ChatOpenAI({ model: MODEL_NAME, temperature: 0 });
 
 const SUMMARY_MESSAGE_INTERVAL = 12; // summarize every 12 messages
 const MIN_MESSAGES_FOR_SUMMARY = 6; // minimum before summarizing
 
-// ===== Phase 4: AnswerPayload + CSV export =====
+// UI contract: these must match the prompt rules / frontend expectations
 const MAX_TABLE_ROWS_IN_RESPONSE = 20; // must match prompt rule unless user asks otherwise
-const CSV_EXPORT_ROW_THRESHOLD = 100; // when >= this, include csv export payload
+const CSV_EXPORT_ROW_THRESHOLD = 21; // when >= this, include csv export payload
+
+// -----------------------------
+// Schemas (best-effort validation)
+// -----------------------------
 
 const TableSchema = z.object({
   columns: z.array(z.string()),
@@ -74,12 +82,16 @@ const AnswerPayloadSchema = z
   })
   .passthrough();
 
+// -----------------------------
+// Small utilities
+// -----------------------------
+
 function safeJsonParse(text) {
   if (!text || typeof text !== "string") return null;
   const trimmed = text.trim();
   if (!trimmed) return null;
 
-  // strip common fenced blocks
+  // Strip common fenced blocks
   const cleaned = trimmed
     .replace(/```json/gi, "")
     .replace(/```/g, "")
@@ -93,25 +105,31 @@ function safeJsonParse(text) {
 }
 
 /**
- * Safely convert ChatOpenAI message content to a string
+ * Convert LangChain message content to a string.
  */
 function contentToString(content) {
   if (typeof content === "string") return content;
+
   if (Array.isArray(content)) {
     return content
-      .map((part) => (typeof part === "string" ? part : part.text || ""))
+      .map((part) => (typeof part === "string" ? part : part?.text || ""))
       .join("");
   }
+
   if (typeof content === "object" && content !== null && "text" in content) {
     return content.text;
   }
+
   return String(content ?? "");
 }
 
+// -----------------------------
+// Non-data classification and response
+// -----------------------------
+
 /**
- * Classify whether the user is asking for data (something that should hit the DB)
- * vs. a general/non-data request.
- * Returns true if it's likely a data question, false otherwise.
+ * Decide if a question should hit the database.
+ * Returns true for likely-data questions, false for non-data questions.
  */
 async function isDataQuestion(question) {
   const classifyPrompt = ChatPromptTemplate.fromMessages([
@@ -122,6 +140,7 @@ async function isDataQuestion(question) {
         "Your job is to decide if the user is asking for DATA from the database",
         "(for example: metrics, counts, lists, breakdowns, comparisons, trends, or reports)",
         "or if they are instead asking for something else (like how the system works, general advice, or small talk).",
+        "note that question might be in reference to previous question/answers in the conversation. for example: 'can you add transaction count to that and remove gender?' - this is valid because it wants data too.",
         "",
         "If the question requires querying or calculating from stored business data, answer exactly: YES",
         "If not, answer exactly: NO",
@@ -135,16 +154,16 @@ async function isDataQuestion(question) {
   const messages = await classifyPrompt.formatMessages({ question });
   const resp = await llm.invoke(messages);
   const text = contentToString(resp.content).trim().toUpperCase();
+
   if (text.startsWith("YES")) return true;
   if (text.startsWith("NO")) return false;
-  // Fallback: be permissive and treat as data question so we don't block valid use
+
+  // Fallback: be permissive so we don't block valid use
   return true;
 }
 
 /**
- * Build a friendly, contextual response for non-data questions.
- * It should acknowledge what the user said, but gently steer them
- * toward asking a data / analytics question instead.
+ * Friendly response for non-data questions.
  */
 async function buildNonDataResponse(question) {
   const prompt = ChatPromptTemplate.fromMessages([
@@ -174,15 +193,21 @@ async function buildNonDataResponse(question) {
   const messages = await prompt.formatMessages({ question });
   const resp = await llm.invoke(messages);
   const text = contentToString(resp.content).trim();
+
   if (!text) {
-    // Fallback static text if the LLM somehow returns empty content
+    // Hard fallback if the model returns empty
     return (
       'Got it. This assistant is wired to answer questions by querying your data (for example: "Show me sales by store for last month" or "Compare loyalty signups by branch"). ' +
       "If you’d like, ask what you want to see in the data and I’ll run the query for you."
     );
   }
+
   return text;
 }
+
+// -----------------------------
+// Conversation context helpers
+// -----------------------------
 
 /**
  * Extract the last N question/answer pairs from a chronological message list.
@@ -191,36 +216,24 @@ async function buildNonDataResponse(question) {
 function extractLastQAPairs(messages, maxPairs = 2) {
   if (!Array.isArray(messages) || messages.length === 0) return [];
 
-  // messages are expected to be in chronological order
   const pairs = [];
-  let currentPair = null;
 
   for (const m of messages) {
     if (m.role === "user") {
-      // start a new pair for each user message
-      currentPair = { question: m.content || "", answer: null };
-      pairs.push(currentPair);
-      // keep only the last maxPairs
-      if (pairs.length > maxPairs) {
-        pairs.shift();
-      }
-    } else if (m.role === "assistant") {
-      // attach assistant reply to the most recent pair without an answer
-      if (pairs.length > 0) {
-        const last = pairs[pairs.length - 1];
-        if (last && !last.answer) {
-          last.answer = m.content || "";
-        }
-      }
+      pairs.push({ question: m.content || "", answer: null });
+      if (pairs.length > maxPairs) pairs.shift();
+      continue;
+    }
+
+    if (m.role === "assistant" && pairs.length > 0) {
+      const last = pairs[pairs.length - 1];
+      if (last && !last.answer) last.answer = m.content || "";
     }
   }
 
   return pairs;
 }
 
-/**
- * Format recent Q&A pairs into a short context string for the LLM.
- */
 function formatRecentQAPairsForContext(pairs) {
   if (!Array.isArray(pairs) || pairs.length === 0) return "";
 
@@ -238,22 +251,17 @@ function formatRecentQAPairsForContext(pairs) {
     .join("\n\n");
 }
 
-/**
- * Format messages into a plain-text transcript for summarization.
- */
 function formatMessagesForSummary(messages) {
   return messages
     .map((m) => {
-      const role = m.role ? m.role.toUpperCase() : "UNKNOWN";
+      const role = m.role ? String(m.role).toUpperCase() : "UNKNOWN";
       return `${role}: ${m.content}`;
     })
     .join("\n\n");
 }
 
 /**
- * Maybe update the conversation_summary for a conversation.
- * - Only runs when messageCount >= MIN_MESSAGES_FOR_SUMMARY
- *   AND messageCount % SUMMARY_MESSAGE_INTERVAL === 0
+ * Update conversation_summary on a cadence.
  */
 async function maybeUpdateConversationSummary(
   convId,
@@ -303,7 +311,6 @@ async function maybeUpdateConversationSummary(
 
   const summaryMsg = await llm.invoke(summaryMessages);
   const updatedSummary = contentToString(summaryMsg.content).trim();
-
   if (!updatedSummary) return null;
 
   await query(
@@ -314,9 +321,6 @@ async function maybeUpdateConversationSummary(
   return updatedSummary;
 }
 
-/**
- * Fetch the latest long-term memory summary for a user, if any.
- */
 async function getUserLongTermMemorySummary(userId) {
   const rows = await query(
     "SELECT memory_summary FROM user_long_term_memory WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
@@ -326,22 +330,24 @@ async function getUserLongTermMemorySummary(userId) {
   return rows[0].memory_summary || "";
 }
 
-/**
- * Derive a conversation title from the first question
- */
 function deriveConversationTitle(question) {
-  const trimmed = question.trim();
+  const trimmed = String(question || "").trim();
   if (!trimmed) return "New conversation";
   return trimmed.length > 80 ? trimmed.slice(0, 77) + "..." : trimmed;
 }
 
+// -----------------------------
+// Main handler
+// -----------------------------
+
 export default async function handler(req, res) {
-  // IMPORTANT: enable streaming immediately so all responses use SSE
+  // Enable SSE immediately: all responses are streamed as events
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
+  // SSE helpers
   function emit(event, data) {
     res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -357,6 +363,7 @@ export default async function handler(req, res) {
     closeWith("error", { code, message, ...extra }, statusCode);
   }
 
+  // Request validation
   if (req.method !== "POST") {
     streamError(405, "METHOD_NOT_ALLOWED", "Method not allowed");
     return;
@@ -385,9 +392,12 @@ export default async function handler(req, res) {
   }
 
   try {
+    // ---------------------------------
+    // 1) Ensure conversation exists
+    // ---------------------------------
+
     let convId = conversationId || null;
 
-    // 1) Ensure conversation exists or create a new one
     if (!convId) {
       const title = deriveConversationTitle(question);
       const convResult = await query(
@@ -396,7 +406,7 @@ export default async function handler(req, res) {
       );
       convId = convResult.insertId;
     } else {
-      // Make sure it belongs to the current user
+      // Ensure the conversation belongs to this user
       const existing = await query(
         "SELECT id FROM conversations WHERE id = ? AND user_id = ?",
         [convId, user.id]
@@ -407,22 +417,28 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2) Insert user message
+    // ---------------------------------
+    // 2) Persist user message
+    // ---------------------------------
+
     const userMsgResult = await query(
       "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
       [convId, user.id, "user", question.trim()]
     );
+
     const userMessageId = userMsgResult.insertId;
     emit("status", { message: "Understanding your question…" });
 
-    // 2.0) Quick classification: is this a data question?
+    // ---------------------------------
+    // 3) Quick classification: data vs non-data
+    // ---------------------------------
+
     let isDataRequest = true;
     try {
       isDataRequest = await isDataQuestion(question);
     } catch (classErr) {
       console.error("Error classifying question as data/non-data:", classErr);
-      // default: treat as data question so we don't block valid flows
-      isDataRequest = true;
+      isDataRequest = true; // permissive fallback
     }
 
     emit("status", {
@@ -430,6 +446,10 @@ export default async function handler(req, res) {
         ? "Preparing to query your data…"
         : "Preparing response…",
     });
+
+    // ---------------------------------
+    // 4) Non-data path (no DB query)
+    // ---------------------------------
 
     if (!isDataRequest) {
       let acknowledgment;
@@ -442,7 +462,7 @@ export default async function handler(req, res) {
           "If you’d like, ask what you want to see in the data and I’ll run the query for you.";
       }
 
-      // Phase 4: answerPayload for non-data
+      // UI contract: stable answerPayload shape
       const answerPayload = {
         version: "v1",
         status: "non_data",
@@ -473,7 +493,7 @@ export default async function handler(req, res) {
         },
       };
 
-      // Store assistant message so the conversation thread stays consistent
+      // Store assistant message
       const assistantMsgResult = await query(
         `INSERT INTO messages
    (conversation_id, user_id, role, content, answer_payload)
@@ -486,9 +506,10 @@ export default async function handler(req, res) {
           JSON.stringify(answerPayload),
         ]
       );
+
       const assistantMessageId = assistantMsgResult.insertId;
 
-      // Optionally log token usage as zeroed for this non-data turn
+      // Token usage: explicitly log zeroed usage for non-data turn
       await query(
         `INSERT INTO token_usage
          (conversation_id, message_id, user_id, model, prompt_tokens, completion_tokens, total_tokens)
@@ -506,12 +527,17 @@ export default async function handler(req, res) {
         messages,
         answerPayload,
       });
+
       return;
     }
 
+    // ---------------------------------
+    // 5) Data path: gather context
+    // ---------------------------------
+
     emit("status", { message: "Gathering user context…" });
 
-    // 2.1) Fetch existing conversation summary + user long-term memory for this request
+    // 5.1 conversation summary
     let conversationSummaryForPrompt = "";
     try {
       const convRows = await query(
@@ -525,9 +551,10 @@ export default async function handler(req, res) {
       console.error("Error fetching conversation summary:", csErr);
     }
 
+    // 5.2 user long-term memory
     const userMemorySummary = await getUserLongTermMemorySummary(user.id);
 
-    // 2.2) Compute recent Q&A pairs (before this question) for extra context
+    // 5.3 recent Q&A (excluding the current user question we just inserted)
     let recentQAPairsText = "";
     try {
       const priorMessages = await query(
@@ -535,10 +562,7 @@ export default async function handler(req, res) {
         [convId]
       );
 
-      // Remove the last message (the current question we just inserted)
-      if (priorMessages.length > 0) {
-        priorMessages.pop();
-      }
+      if (priorMessages.length > 0) priorMessages.pop();
 
       const qaPairs = extractLastQAPairs(priorMessages, 2);
       recentQAPairsText = formatRecentQAPairsForContext(qaPairs);
@@ -547,14 +571,14 @@ export default async function handler(req, res) {
     }
 
     emit("status", { message: "Getting Business Context..." });
-    // 3) RAG: retrieve context from vector DB (optional)
+
+    // 5.4 RAG context (optional)
     let retrievedDocs = [];
     let ragError = null;
 
     if (useRagBool) {
       try {
         const vectorStore = await getVectorStore();
-        // tweak k / filters as needed
         retrievedDocs = await vectorStore.similaritySearch(question, 5);
       } catch (err) {
         console.error("RAG retrieval error:", err);
@@ -583,10 +607,7 @@ export default async function handler(req, res) {
       })
       .join("\n\n");
 
-    // Build a combined "context" string that includes:
-    // - User long-term memory
-    // - Conversation summary
-    // - RAG knowledge base snippets
+    // Build combined context string
     const contextParts = [];
 
     if (recentQAPairsText) {
@@ -617,8 +638,12 @@ export default async function handler(req, res) {
         ? contextParts.join("\n\n---\n\n")
         : "(No additional RAG or memory context available.)";
 
+    // ---------------------------------
+    // 6) NL → SQL
+    // ---------------------------------
+
     emit("status", { message: "Generating SQL query…" });
-    // 4) Build NL -> SQL prompt using schema introspection + memory + RAG context
+
     const schemaText = await getSchemaText();
 
     const sqlPrompt = ChatPromptTemplate.fromMessages([
@@ -675,8 +700,12 @@ export default async function handler(req, res) {
       total_tokens: 0,
     };
 
+    // ---------------------------------
+    // 7) Execute SQL
+    // ---------------------------------
+
     emit("status", { message: "Running query on database…" });
-    // 5) Execute SQL
+
     let rows = [];
     let fields = [];
     let executionError = null;
@@ -697,7 +726,7 @@ export default async function handler(req, res) {
       ? String(executionError.message || executionError)
       : null;
 
-    // 6) Log SQL query
+    // 7.1 Log SQL query execution
     const sqlQueryResult = await query(
       `INSERT INTO sql_queries
        (conversation_id, message_id, user_id, sql_text, status, rows_returned, error_message, duration_ms)
@@ -713,6 +742,7 @@ export default async function handler(req, res) {
         durationMs,
       ]
     );
+
     const sqlQueryId = sqlQueryResult.insertId;
 
     if (executionError) {
@@ -733,8 +763,12 @@ export default async function handler(req, res) {
       return;
     }
 
+    // ---------------------------------
+    // 8) Summarize results into answerText
+    // ---------------------------------
+
     emit("status", { message: "Summarizing results…" });
-    // 7) Generate short text answer based on rows
+
     const sampleRows = rows.slice(0, 50);
 
     const answerPrompt = ChatPromptTemplate.fromMessages([
@@ -790,7 +824,6 @@ export default async function handler(req, res) {
     };
 
     let answerText = "";
-
     if (answerObj && typeof answerObj === "object") {
       answerText = String(answerObj.answerText || "").trim();
     }
@@ -800,6 +833,7 @@ export default async function handler(req, res) {
       answerText = contentToString(answerMsg.content).trim();
     }
 
+    // Token totals across SQL + answer steps (UI contract)
     const totalInputTokens =
       (sqlUsage.input_tokens || 0) + (answerUsage.input_tokens || 0);
     const totalOutputTokens =
@@ -807,7 +841,10 @@ export default async function handler(req, res) {
     const totalTokens =
       (sqlUsage.total_tokens || 0) + (answerUsage.total_tokens || 0);
 
-    // 8) Telemetry: log query, answer, and RAG sources
+    // ---------------------------------
+    // 9) Telemetry: query_logs + sources
+    // ---------------------------------
+
     const usedRagFlag = useRagBool && retrievedDocs.length > 0;
     const answerSummary =
       answerText && answerText.length > 500
@@ -858,12 +895,11 @@ export default async function handler(req, res) {
         });
 
         if (values.length > 0) {
-          // Build a multi-row INSERT with explicit placeholders because our
-          // db helper uses `execute`, which does not expand `VALUES ?`.
+          // Our db helper uses `execute`, which does not expand `VALUES ?`,
+          // so we build explicit placeholders.
           const placeholders = values
             .map(() => "(?, ?, ?, ?, ?, ?)")
             .join(", ");
-
           const flatParams = values.flat();
 
           await query(
@@ -878,9 +914,12 @@ export default async function handler(req, res) {
       }
     }
 
+    // ---------------------------------
+    // 10) Build table + optional CSV download
+    // ---------------------------------
+
     const columns = fields.map((f) => f.name);
 
-    // Phase 4: table + export handling
     const fullRowCount = Array.isArray(rows) ? rows.length : 0;
     const tableTruncated = fullRowCount > MAX_TABLE_ROWS_IN_RESPONSE;
     const tableRowsForUi = tableTruncated
@@ -922,6 +961,10 @@ export default async function handler(req, res) {
       };
     });
 
+    // ---------------------------------
+    // 11) Build answerPayload (UI contract)
+    // ---------------------------------
+
     const answerPayload = {
       version: "v1",
       status: "complete",
@@ -952,16 +995,19 @@ export default async function handler(req, res) {
       },
     };
 
-    // 9) Store assistant message
+    // ---------------------------------
+    // 12) Persist assistant message + token usage
+    // ---------------------------------
+
     const assistantMsgResult = await query(
       `INSERT INTO messages
    (conversation_id, user_id, role, content, answer_payload)
    VALUES (?, ?, ?, ?, ?)`,
       [convId, null, "assistant", answerText, JSON.stringify(answerPayload)]
     );
+
     const assistantMessageId = assistantMsgResult.insertId;
 
-    // 10) Store token usage
     await query(
       `INSERT INTO token_usage
        (conversation_id, message_id, user_id, model, prompt_tokens, completion_tokens, total_tokens)
@@ -977,13 +1023,15 @@ export default async function handler(req, res) {
       ]
     );
 
-    // 11) Fetch full conversation messages for the frontend
+    // ---------------------------------
+    // 13) Fetch updated messages + maybe update summary
+    // ---------------------------------
+
     const messages = await query(
       "SELECT id, role, content, answer_payload, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
       [convId]
     );
 
-    // 11.1) Maybe update conversation summary (for future turns)
     try {
       await maybeUpdateConversationSummary(
         convId,
@@ -994,48 +1042,22 @@ export default async function handler(req, res) {
       console.error("Error updating conversation summary:", summaryErr);
     }
 
-    // Best-effort validation; do not crash the request if schema mismatches
+    // Best-effort validation; never fail the request on schema mismatches
     try {
       AnswerPayloadSchema.parse(answerPayload);
     } catch (apErr) {
       console.error("AnswerPayload validation failed (non-fatal):", apErr);
     }
 
-    //console.log(answerPayload);
+    // ---------------------------------
+    // 14) Final SSE response (UI contract)
+    // ---------------------------------
 
     closeWith("final", {
       conversationId: convId,
       messages,
       answerPayload,
     });
-
-    /*
-    return res.status(200).json({
-      answerPayload,
-      conversationId: convId,
-      messages,
-      status: "complete",
-      answer: answerText,
-      sql,
-      table: {
-        columns,
-        rows: tableRowsForUi,
-      },
-      tokens: {
-        model: MODEL_NAME,
-        input: totalInputTokens,
-        output: totalOutputTokens,
-        total: totalTokens,
-      },
-      sqlQueryId,
-      rag: {
-        requested: useRagBool,
-        used: useRagBool && retrievedDocs.length > 0,
-        error: ragError,
-        sourceCount: ragSources.length,
-        sources: ragSources,
-      },
-    });*/
   } catch (err) {
     console.error("Error in /api/chat/ask:", err);
     if (!res.writableEnded) {

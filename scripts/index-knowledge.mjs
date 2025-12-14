@@ -4,7 +4,9 @@
 //
 // Usage:
 //   node scripts/index-knowledge.mjs
-//   node scripts/index-knowledge.mjs --append   # add to existing collection
+//   node scripts/index-knowledge.mjs --append                     # add to existing collection
+//   node scripts/index-knowledge.mjs --tables users,orders        # only index these tables
+//   node scripts/index-knowledge.mjs --table users --table orders # same as above
 //
 // This file is an ES module (.mjs) that talks to a CommonJS helper
 // in lib/qdrantStore.js. package.json is configured with:
@@ -30,6 +32,65 @@ const __dirname = path.dirname(__filename);
 const { DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, QDRANT_COLLECTION } =
   process.env;
 
+function parseCliArgs(argv) {
+  const args = argv.slice(2);
+
+  const out = {
+    append: false,
+    tables: [], // optional allowlist; empty => all tables
+  };
+
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+
+    if (a === "--append") {
+      out.append = true;
+      continue;
+    }
+
+    // --tables users,orders OR --tables users orders (but we recommend comma-separated)
+    if (a === "--tables" || a.startsWith("--tables=")) {
+      const raw = a.startsWith("--tables=")
+        ? a.split("=").slice(1).join("=")
+        : args[i + 1];
+      if (!a.startsWith("--tables=")) i += 1;
+
+      if (raw) {
+        const parts = String(raw)
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        out.tables.push(...parts);
+      }
+      continue;
+    }
+
+    // Repeatable: --table users --table orders
+    if (a === "--table") {
+      const raw = args[i + 1];
+      i += 1;
+      if (raw) out.tables.push(String(raw).trim());
+      continue;
+    }
+
+    // Ignore unknown flags but keep it visible
+    if (a.startsWith("--")) {
+      console.warn(`Unknown flag ignored: ${a}`);
+    }
+  }
+
+  // de-dupe while keeping order
+  const seen = new Set();
+  out.tables = out.tables.filter((t) => {
+    if (!t) return false;
+    if (seen.has(t)) return false;
+    seen.add(t);
+    return true;
+  });
+
+  return out;
+}
+
 function assertDbEnv() {
   const missing = [];
   if (!DB_HOST) missing.push("DB_HOST");
@@ -50,7 +111,7 @@ function assertDbEnv() {
  * Fetch schema from MySQL and convert to LangChain Documents.
  * One document per table.
  */
-async function fetchSchemaDocs() {
+async function fetchSchemaDocs({ includeTables = [] } = {}) {
   assertDbEnv();
 
   const connection = await mysql.createConnection({
@@ -61,13 +122,24 @@ async function fetchSchemaDocs() {
   });
 
   try {
-    const [tables] = await connection.execute(
-      `SELECT TABLE_NAME, TABLE_COMMENT
-       FROM information_schema.tables
-       WHERE table_schema = ?
-       ORDER BY TABLE_NAME`,
-      [DB_NAME]
-    );
+    const baseSql =
+      `SELECT TABLE_NAME, TABLE_COMMENT\n` +
+      `FROM information_schema.tables\n` +
+      `WHERE table_schema = ?`;
+
+    const params = [DB_NAME];
+
+    let sql = baseSql;
+
+    if (Array.isArray(includeTables) && includeTables.length > 0) {
+      const placeholders = includeTables.map(() => "?").join(",");
+      sql += ` AND TABLE_NAME IN (${placeholders})`;
+      params.push(...includeTables);
+    }
+
+    sql += " ORDER BY TABLE_NAME";
+
+    const [tables] = await connection.execute(sql, params);
 
     const docs = [];
 
@@ -119,7 +191,13 @@ async function fetchSchemaDocs() {
       docs.push(doc);
     }
 
-    console.log(`Fetched schema for ${docs.length} tables from ${DB_NAME}`);
+    const filterNote =
+      Array.isArray(includeTables) && includeTables.length > 0
+        ? ` (filtered: ${includeTables.join(", ")})`
+        : "";
+    console.log(
+      `Fetched schema for ${docs.length} tables from ${DB_NAME}${filterNote}`
+    );
     return docs;
   } finally {
     await connection.end();
@@ -229,7 +307,7 @@ function chunkDocuments(documents) {
  * Main indexing routine.
  */
 async function main() {
-  const append = process.argv.includes("--append");
+  const { append, tables } = parseCliArgs(process.argv);
 
   console.log("=== Retail AI Analyst: Index Knowledge ===");
   console.log(
@@ -240,8 +318,13 @@ async function main() {
   console.log(`Collection: ${QDRANT_COLLECTION}`);
   console.log("");
 
+  if (tables.length > 0) {
+    console.log(`Tables: ${tables.join(", ")}`);
+    console.log("");
+  }
+
   // 1) Prepare documents
-  const schemaDocs = await fetchSchemaDocs();
+  const schemaDocs = await fetchSchemaDocs({ includeTables: tables });
   const businessDocs = loadLocalDocs();
 
   const allDocs = [...schemaDocs, ...businessDocs];

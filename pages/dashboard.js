@@ -1,33 +1,50 @@
 // pages/dashboard.js
+// Main dashboard UI: conversation list + chat + inline result tables + feedback + stats.
+
+import { useEffect, useRef, useState } from "react";
 import { Geist, Geist_Mono } from "next/font/google";
-import { useEffect, useState, useRef } from "react";
+
 import { getUserFromRequest } from "../lib/auth";
+
 import { Button } from "@/components/ui/button";
-import { Settings, Download } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+
+import { Copy, Download, Settings, ThumbsDown, ThumbsUp } from "lucide-react";
 import { saveAs } from "file-saver";
+import Papa from "papaparse";
 
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
+
+// -----------------------------
+// Fonts
+// -----------------------------
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
   subsets: ["latin"],
 });
 
-/*
-const geistMono = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-*/
-
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
 });
 
-// ===== Phase 4: AnswerPayload helpers =====
+// -----------------------------
+// UI constants
+// -----------------------------
+
+const STREAMING_MESSAGE_ID = "streaming";
+const TOAST_TIMEOUT_MS = 1200;
+
+// -----------------------------
+// AnswerPayload helpers
+// -----------------------------
+
+/**
+ * Ensures we always have a consistent answerPayload shape.
+ * (Important: this is UI-contract glue; keep behavior stable.)
+ */
 function normalizeAnswerPayload(payload) {
   if (!payload || typeof payload !== "object") return null;
 
@@ -38,6 +55,7 @@ function normalizeAnswerPayload(payload) {
     const rows = Array.isArray(table.rows) ? table.rows : [];
     let columns = Array.isArray(table.columns) ? table.columns : [];
 
+    // If columns are missing but rows are objects, infer column order from the first row.
     if (
       columns.length === 0 &&
       rows.length > 0 &&
@@ -59,12 +77,17 @@ function normalizeAnswerPayload(payload) {
   return normalized;
 }
 
+/**
+ * Backward compatible extractor.
+ * - Prefer `data.answerPayload` (new)
+ * - Fall back to legacy fields (`answer`, `table`, etc.)
+ */
 function getAnswerPayloadFromApiResponse(data) {
-  // Prefer the new payload if present; fall back to legacy fields.
   let payload = data?.answerPayload || null;
 
   if (!payload) {
     const legacyTable = data?.table || null;
+
     payload = {
       version: "v1",
       status: data?.status || "complete",
@@ -86,7 +109,6 @@ function getAnswerPayloadFromApiResponse(data) {
             rowCount: 0,
             truncated: false,
           },
-
       downloads: [],
       meta: {
         sql: data?.sql || null,
@@ -100,12 +122,17 @@ function getAnswerPayloadFromApiResponse(data) {
   return normalizeAnswerPayload(payload) || payload;
 }
 
+/**
+ * Rebuild a per-message lookup of answer payload metadata from the server messages.
+ * Stored in state as `answerMetaByMessageId`.
+ */
 function buildAnswerMetaByMessage(messages, conversationId) {
   const rebuilt = {};
   if (!Array.isArray(messages)) return rebuilt;
 
   messages.forEach((m) => {
     if (m.role !== "assistant") return;
+
     const rawPayload = m.answer_payload ?? m.answerPayload;
     if (!rawPayload) return;
 
@@ -138,6 +165,7 @@ function downloadCsvFromPayload(payload) {
     (d) => d && d.kind === "csv" && typeof d.content === "string"
   );
   if (!dl) return;
+
   try {
     const blob = new Blob([dl.content], { type: dl.mimeType || "text/csv" });
     saveAs(blob, dl.filename || "export.csv");
@@ -146,8 +174,13 @@ function downloadCsvFromPayload(payload) {
   }
 }
 
+// -----------------------------
+// Virtualized table (for large tables)
+// -----------------------------
+
 function VirtualTable({ columns, rows, maxHeight = 420 }) {
   const parentRef = useRef(null);
+
   const rowVirtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => parentRef.current,
@@ -186,6 +219,7 @@ function VirtualTable({ columns, rows, maxHeight = 420 }) {
               <div style={{ position: "relative", height: totalSize }}>
                 {virtualItems.map((vi) => {
                   const row = rows[vi.index];
+
                   return (
                     <div
                       key={vi.key}
@@ -230,15 +264,59 @@ function VirtualTable({ columns, rows, maxHeight = 420 }) {
   );
 }
 
+// -----------------------------
+// SSE parsing helpers
+// -----------------------------
+
+function parseSseEvent(chunk) {
+  if (!chunk) return { eventName: "message", data: "" };
+
+  const lines = chunk.split(/\r?\n/);
+  let eventName = "message";
+  const dataLines = [];
+
+  lines.forEach((line) => {
+    if (line.startsWith("event:")) {
+      eventName = line.slice(6).trim();
+      return;
+    }
+
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trim());
+    }
+  });
+
+  return { eventName, data: dataLines.join("\n") };
+}
+
+function safeJsonParse(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+// -----------------------------
+// Dashboard page
+// -----------------------------
+
 export default function DashboardPage({ user }) {
+  // Conversations + messages
   const [conversations, setConversations] = useState([]);
   const [selectedConversationId, setSelectedConversationId] = useState(null);
   const [messages, setMessages] = useState([]);
+
+  // Input
   const [question, setQuestion] = useState("");
+
+  // Loading states
   const [loadingConversations, setLoadingConversations] = useState(false);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [sending, setSending] = useState(false);
 
+  // Stats + modals
   const [stats, setStats] = useState({ sqlQueries: [], tokenUsage: [] });
   const [loadingStats, setLoadingStats] = useState(false);
   const [isStatsModalOpen, setIsStatsModalOpen] = useState(false);
@@ -252,32 +330,47 @@ export default function DashboardPage({ user }) {
     weekTotalTokens: 0,
     daily: [],
   });
+
+  // Active answer selection
   const [activeAnswer, setActiveAnswer] = useState(null);
   const [answerMetaByMessageId, setAnswerMetaByMessageId] = useState({});
   const [activeAnswerMeta, setActiveAnswerMeta] = useState(null);
   const [activeAnswerPayload, setActiveAnswerPayload] = useState(null);
   const [showAdvancedStats, setShowAdvancedStats] = useState(false);
+
+  // Settings toggles
   const [useRag, setUseRag] = useState(true);
   const [showInlineVisuals, setShowInlineVisuals] = useState(true);
-  // User memory editor state
+
+  // User memory editor
   const [userMemorySummary, setUserMemorySummary] = useState("");
   const [loadingUserMemory, setLoadingUserMemory] = useState(false);
   const [savingUserMemory, setSavingUserMemory] = useState(false);
   const [userMemoryError, setUserMemoryError] = useState(null);
 
+  // Feedback + copy UI
+  const [feedbackByMessageId, setFeedbackByMessageId] = useState({});
+  const [isFeedbackModalOpen, setIsFeedbackModalOpen] = useState(false);
+  const [feedbackTarget, setFeedbackTarget] = useState(null); // { messageId, conversationId }
+  const [feedbackText, setFeedbackText] = useState("");
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
+  const [copyStatusByMessageId, setCopyStatusByMessageId] = useState({});
+  const [feedbackToastByMessageId, setFeedbackToastByMessageId] = useState({});
+
+  // Streaming management
   const streamControllerRef = useRef(null);
   const [hasStartedChat, setHasStartedChat] = useState(false);
 
+  // Auto-scroll
   const messagesEndRef = useRef(null);
 
-  // Auto scroll to bottom when messages change
   useEffect(() => {
     if (messagesEndRef.current) {
       messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages]);
 
-  // Load conversations on mount
+  // Initial load + cleanup
   useEffect(() => {
     fetchConversations();
   }, []);
@@ -289,6 +382,10 @@ export default function DashboardPage({ user }) {
       }
     };
   }, []);
+
+  // -----------------------------
+  // Data fetching
+  // -----------------------------
 
   async function fetchConversations() {
     setLoadingConversations(true);
@@ -306,8 +403,8 @@ export default function DashboardPage({ user }) {
 
   async function fetchMessages(conversationId) {
     if (!conversationId) return;
-    setLoadingMessages(true);
 
+    setLoadingMessages(true);
     try {
       const res = await fetch(
         `/api/chat/messages?conversationId=${conversationId}`
@@ -316,10 +413,9 @@ export default function DashboardPage({ user }) {
 
       const data = await res.json();
       const msgs = data.messages || [];
-      setMessages(msgs);
 
-      const rebuiltMeta = buildAnswerMetaByMessage(msgs, conversationId);
-      setAnswerMetaByMessageId(rebuiltMeta);
+      setMessages(msgs);
+      setAnswerMetaByMessageId(buildAnswerMetaByMessage(msgs, conversationId));
       setActiveAnswerMeta(null);
       setActiveAnswerPayload(null);
     } catch (err) {
@@ -342,6 +438,7 @@ export default function DashboardPage({ user }) {
       );
       if (!res.ok) throw new Error("Failed to load stats");
       const data = await res.json();
+
       setStats({
         sqlQueries: data.sqlQueries || [],
         tokenUsage: data.tokenUsage || [],
@@ -353,6 +450,10 @@ export default function DashboardPage({ user }) {
     }
   }
 
+  // -----------------------------
+  // Usage stats modal
+  // -----------------------------
+
   async function openUsageStats() {
     setIsSettingsOpen(false);
     setIsUsageModalOpen(true);
@@ -361,7 +462,9 @@ export default function DashboardPage({ user }) {
     try {
       const res = await fetch("/api/chat/usage");
       const data = await res.json();
+
       console.log("Usage data:", data);
+
       if (!res.ok) {
         console.error(data.error || "Failed to load usage stats");
         return;
@@ -374,11 +477,13 @@ export default function DashboardPage({ user }) {
         summary.lifetime_total ??
         summary.lifetimeTokens ??
         0;
+
       const month =
         data.monthTotalTokens ??
         summary.month_total ??
         summary.monthTokens ??
         0;
+
       const week =
         data.weekTotalTokens ?? summary.week_total ?? summary.weekTokens ?? 0;
 
@@ -417,7 +522,10 @@ export default function DashboardPage({ user }) {
     }
   }
 
-  // Open settings modal and load user memory
+  // -----------------------------
+  // Settings modal (user memory)
+  // -----------------------------
+
   function openSettingsModal() {
     setIsSettingsOpen(false);
     setIsSettingsModalOpen(true);
@@ -427,14 +535,17 @@ export default function DashboardPage({ user }) {
   async function loadUserMemory() {
     setLoadingUserMemory(true);
     setUserMemoryError(null);
+
     try {
       const res = await fetch("/api/user/memory");
       const data = await res.json();
+
       if (!res.ok) {
         console.error(data.error || "Failed to load user memory");
         setUserMemoryError(data.error || "Failed to load user memory.");
         return;
       }
+
       setUserMemorySummary(data.memorySummary || "");
     } catch (err) {
       console.error("Error loading user memory:", err);
@@ -447,19 +558,23 @@ export default function DashboardPage({ user }) {
   async function saveUserMemory() {
     setSavingUserMemory(true);
     setUserMemoryError(null);
+
     try {
       const res = await fetch("/api/user/memory", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ memorySummary: userMemorySummary }),
       });
+
       const data = await res.json();
+
       if (!res.ok) {
         console.error(data.error || "Failed to save user memory");
         setUserMemoryError(data.error || "Failed to save user memory.");
         return;
       }
-      // normalize summary from server in case it modified/trimmed it
+
+      // Normalize summary from server in case it modified/trimmed it
       setUserMemorySummary(data.memorySummary || "");
     } catch (err) {
       console.error("Error saving user memory:", err);
@@ -469,38 +584,307 @@ export default function DashboardPage({ user }) {
     }
   }
 
-  function handleSelectConversation(id) {
+  // -----------------------------
+  // Conversation selection
+  // -----------------------------
+
+  function abortStreamingIfAny() {
     if (streamControllerRef.current) {
       streamControllerRef.current.abort();
       streamControllerRef.current = null;
     }
+  }
+
+  function handleSelectConversation(id) {
+    abortStreamingIfAny();
+
     setSelectedConversationId(id);
     setHasStartedChat(true);
+
     setAnswerMetaByMessageId({});
     setActiveAnswerMeta(null);
     setActiveAnswerPayload(null);
+
     fetchMessages(id);
     fetchStats(id);
   }
 
   function handleNewConversation() {
-    if (streamControllerRef.current) {
-      streamControllerRef.current.abort();
-      streamControllerRef.current = null;
-    }
+    abortStreamingIfAny();
+
     setSelectedConversationId(null);
     setMessages([]);
     setQuestion("");
+
     setStats({ sqlQueries: [], tokenUsage: [] });
+
     setAnswerMetaByMessageId({});
     setActiveAnswerMeta(null);
     setActiveAnswerPayload(null);
+
     setUseRag(true);
     setHasStartedChat(false);
+
+    setFeedbackByMessageId({});
+    setCopyStatusByMessageId({});
+    setFeedbackToastByMessageId({});
+
+    setIsFeedbackModalOpen(false);
+    setFeedbackTarget(null);
+    setFeedbackText("");
+    setFeedbackSubmitting(false);
+  }
+
+  // -----------------------------
+  // Feedback + copy helpers
+  // -----------------------------
+
+  function showToastForMessage(setter, messageId, value) {
+    setter((prev) => ({ ...prev, [messageId]: value }));
+
+    window.setTimeout(() => {
+      setter((prev) => {
+        const next = { ...prev };
+        delete next[messageId];
+        return next;
+      });
+    }, TOAST_TIMEOUT_MS);
+  }
+
+  async function postAnswerFeedback({
+    conversationId,
+    messageId,
+    rating,
+    reason,
+  }) {
+    // Expected: POST /api/chat/feedback { conversationId, messageId, rating, reason }
+    try {
+      const res = await fetch("/api/chat/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          conversationId,
+          messageId,
+          rating,
+          reason: reason || null,
+        }),
+      });
+
+      if (!res.ok) {
+        let payload = null;
+        try {
+          payload = await res.json();
+        } catch (_) {
+          // ignore
+        }
+        console.error(
+          "Feedback API failed:",
+          res.status,
+          payload?.error || payload || "unknown error"
+        );
+        return { ok: false };
+      }
+
+      return { ok: true };
+    } catch (err) {
+      console.error("Feedback API error:", err);
+      return { ok: false };
+    }
+  }
+
+  function openFeedbackModalForMessage(messageId) {
+    const convId = selectedConversationId;
+    setFeedbackTarget({ messageId, conversationId: convId });
+    setFeedbackText("");
+    setIsFeedbackModalOpen(true);
+  }
+
+  async function submitThumbsUp(messageId) {
+    const convId = selectedConversationId;
+    if (!convId) return;
+
+    // optimistic UI
+    setFeedbackByMessageId((prev) => ({
+      ...prev,
+      [messageId]: { rating: "up", submittedAt: Date.now() },
+    }));
+
+    // subtle UI feedback (like copy)
+    showToastForMessage(setFeedbackToastByMessageId, messageId, "up");
+
+    const result = await postAnswerFeedback({
+      conversationId: convId,
+      messageId,
+      rating: "up",
+      reason: null,
+    });
+
+    if (!result.ok) {
+      // roll back
+      setFeedbackByMessageId((prev) => {
+        const next = { ...prev };
+        delete next[messageId];
+        return next;
+      });
+      setFeedbackToastByMessageId((prev) => {
+        const next = { ...prev };
+        delete next[messageId];
+        return next;
+      });
+    }
+  }
+
+  async function submitThumbsDown() {
+    const convId = feedbackTarget?.conversationId;
+    const messageId = feedbackTarget?.messageId;
+    if (!convId || !messageId) return;
+
+    setFeedbackSubmitting(true);
+
+    // optimistic UI
+    setFeedbackByMessageId((prev) => ({
+      ...prev,
+      [messageId]: { rating: "down", submittedAt: Date.now() },
+    }));
+
+    const result = await postAnswerFeedback({
+      conversationId: convId,
+      messageId,
+      rating: "down",
+      reason: feedbackText.trim() || null,
+    });
+
+    setFeedbackSubmitting(false);
+
+    if (!result.ok) {
+      // roll back
+      setFeedbackByMessageId((prev) => {
+        const next = { ...prev };
+        delete next[messageId];
+        return next;
+      });
+      return;
+    }
+
+    setIsFeedbackModalOpen(false);
+    setFeedbackTarget(null);
+    setFeedbackText("");
+
+    // subtle UI feedback (like copy)
+    showToastForMessage(setFeedbackToastByMessageId, messageId, "down");
+  }
+
+  function buildCopyTextForMessage(messageId) {
+    const msg = messages.find((m) => m.id === messageId);
+    const answerText = msg?.content || "";
+
+    const payload = answerMetaByMessageId?.[messageId]?.answerPayload;
+    const table = payload?.table;
+    const columns = Array.isArray(table?.columns) ? table.columns : [];
+    const rows = Array.isArray(table?.rows) ? table.rows : [];
+
+    let tableText = "";
+
+    if (columns.length > 0 && rows.length > 0) {
+      try {
+        // Build a CSV using column order.
+        const normalizedRows = rows.map((r) => {
+          const out = {};
+          columns.forEach((c) => {
+            out[c] = r?.[c] == null ? "" : r[c];
+          });
+          return out;
+        });
+
+        tableText = Papa.unparse(normalizedRows, { columns });
+      } catch (err) {
+        console.error("Failed to build CSV for clipboard:", err);
+      }
+    }
+
+    return tableText ? `${answerText}\n\n---\n\n${tableText}` : answerText;
+  }
+
+  async function copyMessageToClipboard(messageId) {
+    const text = buildCopyTextForMessage(messageId);
+    if (!text) return;
+
+    let ok = false;
+
+    // Preferred clipboard API
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      }
+    } catch (err) {
+      console.warn("navigator.clipboard failed, falling back:", err);
+    }
+
+    // Fallback for older browsers
+    if (!ok) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "absolute";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch (err) {
+        console.error("Clipboard fallback failed:", err);
+      }
+    }
+
+    if (ok) {
+      showToastForMessage(setCopyStatusByMessageId, messageId, "copied");
+    }
+  }
+
+  // -----------------------------
+  // Ask / SSE streaming
+  // -----------------------------
+
+  function upsertStreamingStatusMessage(message) {
+    setMessages((prev) => {
+      let found = false;
+
+      const updated = prev.map((m) => {
+        if (m.id === STREAMING_MESSAGE_ID) {
+          found = true;
+          return { ...m, content: message };
+        }
+        return m;
+      });
+
+      if (!found) {
+        updated.push({
+          id: STREAMING_MESSAGE_ID,
+          role: "assistant",
+          content: message,
+        });
+      }
+
+      return updated;
+    });
+  }
+
+  function replaceStreamingWithError(message) {
+    setMessages((prev) => [
+      ...prev.filter((m) => m.id !== STREAMING_MESSAGE_ID),
+      {
+        id: `error-${Date.now()}`,
+        role: "assistant",
+        content: `Error: ${message}`,
+      },
+    ]);
   }
 
   async function handleAsk(e) {
     e.preventDefault();
+
     const trimmedQuestion = question.trim();
     if (!trimmedQuestion || sending) return;
 
@@ -511,7 +895,7 @@ export default function DashboardPage({ user }) {
     };
 
     const tempAssistantMessage = {
-      id: "streaming",
+      id: STREAMING_MESSAGE_ID,
       role: "assistant",
       content: "Starting analysis…",
     };
@@ -520,15 +904,13 @@ export default function DashboardPage({ user }) {
     setQuestion("");
     setHasStartedChat(true);
 
-    if (streamControllerRef.current) {
-      streamControllerRef.current.abort();
-      streamControllerRef.current = null;
-    }
+    abortStreamingIfAny();
 
     const controller = new AbortController();
     streamControllerRef.current = controller;
 
     setSending(true);
+
     try {
       const response = await fetch("/api/chat/ask", {
         method: "POST",
@@ -547,65 +929,24 @@ export default function DashboardPage({ user }) {
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+
       let buffer = "";
       let shouldStop = false;
 
-      const parseSseEvent = (chunk) => {
-        if (!chunk) {
-          return { eventName: "message", data: "" };
-        }
-        const lines = chunk.split(/\r?\n/);
-        let eventName = "message";
-        const dataLines = [];
-
-        lines.forEach((line) => {
-          if (line.startsWith("event:")) {
-            eventName = line.slice(6).trim();
-          } else if (line.startsWith("data:")) {
-            dataLines.push(line.slice(5).trim());
-          }
-        });
-
-        return { eventName, data: dataLines.join("\n") };
-      };
-
       const handleSseEvent = (eventName, rawData) => {
-        let payload = null;
-        if (rawData) {
-          try {
-            payload = JSON.parse(rawData);
-          } catch (err) {
-            console.error("Failed to parse SSE payload:", err);
-          }
-        }
+        const payload = rawData ? safeJsonParse(rawData) : null;
 
+        // 1) Status updates: render the emitted status in the streaming bubble.
         if (eventName === "status" && payload?.message) {
-          setMessages((prev) => {
-            let found = false;
-            const updated = prev.map((m) => {
-              if (m.id === "streaming") {
-                found = true;
-                return { ...m, content: payload.message };
-              }
-              return m;
-            });
-
-            if (!found) {
-              updated.push({
-                id: "streaming",
-                role: "assistant",
-                content: payload.message,
-              });
-            }
-
-            return updated;
-          });
+          upsertStreamingStatusMessage(payload.message);
           return;
         }
 
+        // 2) Final: replace temp messages with server messages and update meta.
         if (eventName === "final" && payload) {
           shouldStop = true;
           streamControllerRef.current = null;
+
           const convId = payload.conversationId || selectedConversationId;
           const serverMessages = Array.isArray(payload.messages)
             ? payload.messages
@@ -613,11 +954,13 @@ export default function DashboardPage({ user }) {
 
           setSelectedConversationId(convId);
           setMessages(serverMessages);
+
           const rebuiltMeta = buildAnswerMetaByMessage(serverMessages, convId);
           setAnswerMetaByMessageId(rebuiltMeta);
 
           const finalPayload = getAnswerPayloadFromApiResponse(payload);
           setActiveAnswerPayload(finalPayload);
+
           setActiveAnswerMeta(
             finalPayload
               ? {
@@ -631,25 +974,19 @@ export default function DashboardPage({ user }) {
           );
 
           fetchConversations();
-          if (convId) {
-            fetchStats(convId);
-          }
+          if (convId) fetchStats(convId);
           return;
         }
 
+        // 3) Error
         if (eventName === "error") {
           shouldStop = true;
           streamControllerRef.current = null;
+
           const message =
             payload?.message || "Unable to process your request right now.";
-          setMessages((prev) => [
-            ...prev.filter((m) => m.id !== "streaming"),
-            {
-              id: `error-${Date.now()}`,
-              role: "assistant",
-              content: `Error: ${message}`,
-            },
-          ]);
+
+          replaceStreamingWithError(message);
           setActiveAnswerMeta(null);
           setActiveAnswerPayload(null);
           return;
@@ -658,41 +995,42 @@ export default function DashboardPage({ user }) {
 
       const processBuffer = () => {
         let boundary = buffer.indexOf("\n\n");
+
         while (boundary !== -1) {
           const rawEvent = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
+
           const { eventName, data } = parseSseEvent(rawEvent);
           handleSseEvent(eventName, data);
-          if (shouldStop) {
-            break;
-          }
+
+          if (shouldStop) break;
+
           boundary = buffer.indexOf("\n\n");
         }
       };
 
+      // Stream loop
       while (!shouldStop) {
         const { done, value } = await reader.read();
         if (done) break;
+
         buffer += decoder
           .decode(value, { stream: true })
           .replace(/\r\n/g, "\n");
         processBuffer();
+
         if (shouldStop) break;
       }
 
+      // Flush any remaining buffered content
       buffer += decoder.decode().replace(/\r\n/g, "\n");
       processBuffer();
 
+      // If the stream ends unexpectedly without a final event
       if (!shouldStop) {
         console.error("SSE connection closed before final event.");
-        setMessages((prev) => [
-          ...prev.filter((m) => m.id !== "streaming"),
-          {
-            id: `error-${Date.now()}`,
-            role: "assistant",
-            content: "Error: Connection closed unexpectedly.",
-          },
-        ]);
+
+        replaceStreamingWithError("Connection closed unexpectedly.");
         setActiveAnswerMeta(null);
         setActiveAnswerPayload(null);
       }
@@ -701,14 +1039,7 @@ export default function DashboardPage({ user }) {
         console.warn("Cancelled in-flight request.");
       } else {
         console.error("Error sending question:", err);
-        setMessages((prev) => [
-          ...prev.filter((m) => m.id !== "streaming"),
-          {
-            id: `error-${Date.now()}`,
-            role: "assistant",
-            content: "Error: Unable to process your request.",
-          },
-        ]);
+        replaceStreamingWithError("Unable to process your request.");
       }
     } finally {
       setSending(false);
@@ -716,16 +1047,25 @@ export default function DashboardPage({ user }) {
     }
   }
 
+  // -----------------------------
+  // Stats modal open/close
+  // -----------------------------
+
   function handleOpenStatsForMessage(msg) {
     if (!selectedConversationId) return;
+
     setActiveAnswer(msg);
+
     const meta = answerMetaByMessageId[msg.id];
-    // if we don't have per-message meta yet (e.g., older answers),
-    // keep whatever active meta we already have as a fallback
+
+    // If we don't have per-message meta yet (e.g., older answers),
+    // keep whatever active meta we already have as a fallback.
     setActiveAnswerMeta((prev) => meta || prev);
     setActiveAnswerPayload((prev) => meta?.answerPayload || prev);
-    // ensure latest stats for this conversation
+
+    // Ensure latest stats for this conversation
     fetchStats(selectedConversationId);
+
     setIsStatsModalOpen(true);
   }
 
@@ -735,6 +1075,175 @@ export default function DashboardPage({ user }) {
     setShowAdvancedStats(false);
     setActiveAnswerPayload(null);
   }
+
+  // -----------------------------
+  // Message rendering helpers
+  // -----------------------------
+
+  function InlineResults({ messageId }) {
+    const payload = answerMetaByMessageId?.[messageId]?.answerPayload;
+
+    if (!payload) return null;
+    if (!showInlineVisuals) return null;
+
+    const table = payload?.table;
+    const columns = table?.columns || [];
+    const rows = table?.rows || [];
+
+    const hasTable = rows.length > 0 && columns.length > 0;
+    if (!hasTable) return null;
+
+    return (
+      <div className="mt-2 rounded-md border border-neutral-200 bg-white">
+        <div className="flex items-center justify-between border-b border-neutral-100 px-3 py-2">
+          <div className="text-[12px] font-semibold text-neutral-800">
+            Results
+          </div>
+          <div className="flex items-center gap-2">
+            {table?.truncated ? (
+              <span className="rounded-sm bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800">
+                Preview truncated
+              </span>
+            ) : null}
+
+            {payload?.downloads?.some((d) => d?.kind === "csv") ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="h-7 border-neutral-300 text-neutral-700 hover:bg-neutral-100"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  downloadCsvFromPayload(payload);
+                }}
+              >
+                <Download className="mr-1 h-3.5 w-3.5" />
+                CSV
+              </Button>
+            ) : null}
+          </div>
+        </div>
+
+        {rows.length > 100 ? (
+          <VirtualTable columns={columns} rows={rows} maxHeight={320} />
+        ) : (
+          <div className="max-h-80 overflow-auto">
+            <table className="min-w-full border-collapse text-[12px]">
+              <thead className="sticky top-0 z-10 bg-neutral-50">
+                <tr>
+                  {columns.map((col) => (
+                    <th
+                      key={col}
+                      className="px-2 py-1 text-left font-medium text-neutral-700"
+                    >
+                      {col}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, idx) => (
+                  <tr
+                    key={idx}
+                    className={idx % 2 === 0 ? "bg-white" : "bg-neutral-50"}
+                  >
+                    {columns.map((col) => (
+                      <td
+                        key={col}
+                        className="px-2 py-1 whitespace-nowrap font-mono text-[10px] text-neutral-800"
+                      >
+                        {row?.[col] == null ? "" : String(row[col])}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="border-t border-neutral-100 px-3 py-2 text-[10px] text-neutral-600">
+          Rows returned:{" "}
+          {table?.rowCount?.toLocaleString?.() ||
+            table?.rowCount ||
+            rows.length}
+        </div>
+      </div>
+    );
+  }
+
+  function AnswerActions({ messageId }) {
+    const rating = feedbackByMessageId?.[messageId]?.rating;
+
+    return (
+      <div className="mt-2 flex items-center gap-1 text-[10px]">
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className={`h-7 w-7 border-none bg-neutral-100 shadow-none text-neutral-400 hover:bg-neutral-100 ${
+            rating === "up" ? "bg-neutral-100" : ""
+          }`}
+          onClick={(e) => {
+            e.stopPropagation();
+            submitThumbsUp(messageId);
+          }}
+          title="Thumbs up"
+          aria-label="Thumbs up"
+        >
+          <ThumbsUp className="h-3.5 w-3.5" />
+        </Button>
+
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className={`h-7 w-7 border-none bg-neutral-100 shadow-none text-neutral-400 hover:bg-neutral-100 ${
+            rating === "down" ? "bg-neutral-100" : ""
+          }`}
+          onClick={(e) => {
+            e.stopPropagation();
+            openFeedbackModalForMessage(messageId);
+          }}
+          title="Thumbs down"
+          aria-label="Thumbs down"
+        >
+          <ThumbsDown className="h-3.5 w-3.5" />
+        </Button>
+
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          className="h-7 w-7 border-none bg-neutral-100 shadow-none text-neutral-400 hover:bg-neutral-100"
+          onClick={(e) => {
+            e.stopPropagation();
+            copyMessageToClipboard(messageId);
+          }}
+          title="Copy answer + data"
+          aria-label="Copy answer + data"
+        >
+          <Copy className="h-3.5 w-3.5" />
+        </Button>
+
+        {copyStatusByMessageId?.[messageId] === "copied" ? (
+          <span className="ml-2 text-[10px] text-neutral-500">Copied</span>
+        ) : null}
+
+        {feedbackToastByMessageId?.[messageId] ? (
+          <span className="ml-2 text-[10px] text-neutral-500">
+            {feedbackToastByMessageId[messageId] === "up"
+              ? "Saved"
+              : "Feedback sent"}
+          </span>
+        ) : null}
+      </div>
+    );
+  }
+
+  // -----------------------------
+  // Render
+  // -----------------------------
 
   const hasConversations = conversations.length > 0;
   const isChatStarted = hasStartedChat || !!selectedConversationId;
@@ -767,12 +1276,12 @@ export default function DashboardPage({ user }) {
             <CardContent className="h-full p-0">
               <div className="flex h-full max-h-full flex-col divide-y divide-neutral-100 overflow-y-auto">
                 {loadingConversations && (
-                  <div className="p-3 text-sm text-neutral-500">
+                  <div className="p-3 text-xs text-neutral-500">
                     Loading conversations…
                   </div>
                 )}
                 {!loadingConversations && conversations.length === 0 && (
-                  <div className="p-3 text-sm text-neutral-500">
+                  <div className="p-3 text-xs text-neutral-500">
                     No conversations yet. Ask your first question.
                   </div>
                 )}
@@ -781,7 +1290,7 @@ export default function DashboardPage({ user }) {
                     key={conv.id}
                     type="button"
                     onClick={() => handleSelectConversation(conv.id)}
-                    className={`flex w-full flex-col items-start px-3 py-2 text-left text-sm transition ${
+                    className={`flex w-full flex-col items-start px-3 py-2 text-left text-xs transition ${
                       selectedConversationId === conv.id
                         ? "bg-red-50 text-red-800 rounded-xs"
                         : "hover:bg-neutral-100"
@@ -810,7 +1319,7 @@ export default function DashboardPage({ user }) {
 
         <div className="mt-auto px-4 pb-4">
           <div className="flex items-center justify-between gap-2">
-            <div className="max-w-[70%] truncate text-sm text-neutral-600">
+            <div className="max-w-[70%] truncate text-xs text-neutral-600">
               {user?.name || user?.email}
             </div>
             <div className="relative">
@@ -825,7 +1334,7 @@ export default function DashboardPage({ user }) {
               </Button>
 
               {isSettingsOpen && (
-                <div className="absolute bottom-10 right-0 w-40 rounded-md border border-neutral-200 bg-white shadow-lg text-sm">
+                <div className="absolute bottom-10 right-0 w-40 rounded-md border border-neutral-200 bg-white shadow-lg text-xs">
                   <button
                     type="button"
                     className="block w-full px-3 py-2 text-left text-neutral-700 hover:bg-neutral-100"
@@ -870,12 +1379,12 @@ export default function DashboardPage({ user }) {
                 {/* Messages */}
                 <div className="flex-1 min-h-0 space-y-4 overflow-y-auto p-3 text-md pr-8">
                   {loadingMessages && (
-                    <p className="text-sm text-neutral-500">
+                    <p className="text-xs text-neutral-500">
                       Loading messages…
                     </p>
                   )}
                   {!loadingMessages && messages.length === 0 && (
-                    <p className="text-sm text-neutral-500">
+                    <p className="text-xs text-neutral-500">
                       Start a new conversation or pick an existing one.
                     </p>
                   )}
@@ -890,14 +1399,14 @@ export default function DashboardPage({ user }) {
                         }`}
                       >
                         {isUser ? (
-                          <div className="max-w-[75%] rounded-md bg-neutral-400 px-3 py-2 text-sm leading-relaxed text-neutral-50">
+                          <div className="max-w-[75%] rounded-md bg-neutral-400 px-3 py-2 text-xs leading-relaxed text-neutral-50">
                             {msg.content}
                           </div>
                         ) : (
                           <div className="w-full max-w-[75%] mb-3">
                             {/* Answer bubble */}
                             <div
-                              className="rounded-md border border-neutral-200 bg-white px-3 py-2 text-sm leading-relaxed text-neutral-800 cursor-pointer hover:bg-neutral-50"
+                              className="rounded-md border border-neutral-200 bg-white px-3 py-2 text-xs leading-relaxed text-neutral-800 cursor-pointer hover:bg-neutral-50"
                               onClick={() => handleOpenStatsForMessage(msg)}
                             >
                               {msg.content}
@@ -1010,6 +1519,77 @@ export default function DashboardPage({ user }) {
 
                               return null;
                             })()}
+
+                            {/* Answer actions */}
+                            <div className="mt-2 flex items-center gap-1 text-[10px]">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="icon"
+                                className={`h-7 w-7 border-none bg-neutral-100 shadow-none text-neutral-400 hover:bg-neutral-100 ${
+                                  feedbackByMessageId?.[msg.id]?.rating === "up"
+                                    ? "bg-neutral-100"
+                                    : ""
+                                }`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  submitThumbsUp(msg.id);
+                                }}
+                                title="Thumbs up"
+                                aria-label="Thumbs up"
+                              >
+                                <ThumbsUp className="h-3.5 w-3.5" />
+                              </Button>
+
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="icon"
+                                className={`h-7 w-7 border-none bg-neutral-100 shadow-none text-neutral-400 hover:bg-neutral-100 ${
+                                  feedbackByMessageId?.[msg.id]?.rating ===
+                                  "down"
+                                    ? "bg-neutral-100"
+                                    : ""
+                                }`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openFeedbackModalForMessage(msg.id);
+                                }}
+                                title="Thumbs down"
+                                aria-label="Thumbs down"
+                              >
+                                <ThumbsDown className="h-3.5 w-3.5" />
+                              </Button>
+
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="icon"
+                                className="h-7 w-7 border-none bg-neutral-100 shadow-none text-neutral-400 hover:bg-neutral-100"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  copyMessageToClipboard(msg.id);
+                                }}
+                                title="Copy answer + data"
+                                aria-label="Copy answer + data"
+                              >
+                                <Copy className="h-3.5 w-3.5" />
+                              </Button>
+
+                              {copyStatusByMessageId?.[msg.id] === "copied" ? (
+                                <span className="ml-2 text-[10px] text-neutral-500">
+                                  Copied
+                                </span>
+                              ) : null}
+
+                              {feedbackToastByMessageId?.[msg.id] ? (
+                                <span className="ml-2 text-[10px] text-neutral-500">
+                                  {feedbackToastByMessageId[msg.id] === "up"
+                                    ? "Saved"
+                                    : "Feedback sent"}
+                                </span>
+                              ) : null}
+                            </div>
                           </div>
                         )}
                       </div>
@@ -1090,7 +1670,7 @@ export default function DashboardPage({ user }) {
                 Close
               </Button>
             </div>
-            <div className="space-y-4 px-4 py-4 text-sm">
+            <div className="space-y-4 px-4 py-4 text-xs">
               <div className="flex items-center justify-between">
                 <div>
                   <div className="text-[12px] font-semibold text-neutral-800">
@@ -1179,6 +1759,84 @@ export default function DashboardPage({ user }) {
         </div>
       )}
 
+      {/* Feedback (thumbs down) modal */}
+      {isFeedbackModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="w-full max-w-lg rounded-lg border border-neutral-200 bg-white shadow-lg">
+            <div className="flex items-center justify-between border-b border-neutral-100 px-4 py-3">
+              <div>
+                <h2 className="text-md font-medium text-neutral-900">
+                  Report an issue with this answer
+                </h2>
+                {feedbackTarget?.messageId ? (
+                  <p className="mt-1 line-clamp-2 text-xs text-neutral-500">
+                    Message ID: {feedbackTarget.messageId}
+                  </p>
+                ) : null}
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="border-neutral-300 text-neutral-700 hover:bg-neutral-100"
+                onClick={() => {
+                  setIsFeedbackModalOpen(false);
+                  setFeedbackTarget(null);
+                  setFeedbackText("");
+                }}
+                disabled={feedbackSubmitting}
+              >
+                Close
+              </Button>
+            </div>
+
+            <div className="space-y-3 px-4 py-4 text-xs">
+              <div>
+                <div className="text-[12px] font-semibold text-neutral-800">
+                  What went wrong? (optional)
+                </div>
+                <div className="mt-1 text-[12px] text-neutral-600">
+                  If you add context, we can improve future answers.
+                </div>
+                <textarea
+                  className="mt-2 h-28 w-full rounded-md border border-neutral-200 bg-neutral-50 p-2 text-[12px] leading-relaxed text-neutral-800 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-500"
+                  value={feedbackText}
+                  onChange={(e) => setFeedbackText(e.target.value)}
+                  placeholder="E.g., wrong date range, wrong filters, should be grouped by store, etc."
+                  disabled={feedbackSubmitting}
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="border-neutral-300 text-neutral-700 hover:bg-neutral-100"
+                  onClick={() => {
+                    setIsFeedbackModalOpen(false);
+                    setFeedbackTarget(null);
+                    setFeedbackText("");
+                  }}
+                  disabled={feedbackSubmitting}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  className="bg-neutral-900 text-neutral-50 hover:bg-neutral-800"
+                  onClick={submitThumbsDown}
+                  disabled={feedbackSubmitting}
+                >
+                  {feedbackSubmitting ? "Submitting…" : "Submit"}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Usage stats modal */}
       {isUsageModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
@@ -1197,7 +1855,7 @@ export default function DashboardPage({ user }) {
                 Close
               </Button>
             </div>
-            <div className="space-y-4 px-4 py-4 text-sm">
+            <div className="space-y-4 px-4 py-4 text-xs">
               {usageLoading ? (
                 <p className="text-neutral-500">Loading usage stats…</p>
               ) : (
@@ -1318,7 +1976,7 @@ export default function DashboardPage({ user }) {
                   SQL queries &amp; token usage
                 </h2>
                 {activeAnswer && (
-                  <p className="mt-1 line-clamp-2 text-sm text-neutral-500">
+                  <p className="mt-1 line-clamp-2 text-xs text-neutral-500">
                     For answer: {activeAnswer.content}
                   </p>
                 )}
@@ -1335,7 +1993,7 @@ export default function DashboardPage({ user }) {
             </div>
 
             <div
-              className="space-y-4 px-4 py-3 text-sm overflow-y-auto"
+              className="space-y-4 px-4 py-3 text-xs overflow-y-auto"
               style={{ maxHeight: "calc(85vh - 56px)" }}
             >
               {!selectedConversationId ? (
@@ -1532,7 +2190,7 @@ export default function DashboardPage({ user }) {
                       {/* Recent SQL queries */}
                       <div>
                         <div className="mb-1 flex items-center justify-between">
-                          <h3 className="text-sm font-semibold text-neutral-700">
+                          <h3 className="text-xs font-semibold text-neutral-700">
                             Recent SQL queries
                           </h3>
                           {loadingStats && (
@@ -1590,7 +2248,7 @@ export default function DashboardPage({ user }) {
                       {/* Recent token usage */}
                       <div>
                         <div className="mb-1 flex items-center justify-between">
-                          <h3 className="text-sm font-semibold text-neutral-700">
+                          <h3 className="text-xs font-semibold text-neutral-700">
                             Recent token usage
                           </h3>
                         </div>

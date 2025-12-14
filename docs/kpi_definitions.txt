@@ -13,4 +13,8 @@ When no clear metric is specified but the user asks for Top Member, assume that 
 
 Frequency is the average number of monthly visits of a member for that period.  
 
+Average Monthly Visits is computed by taking the transaction count from metrics table and dividing it by the number of distinct months from the metrics table
+
+Transaction count is derived directly from the metrics tables
+
 When counting members for demographics report or for a list, always use COUNT(DISTINT id) to avoid double counting entries when there are joins made.

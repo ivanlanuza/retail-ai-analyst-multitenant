@@ -1,0 +1,14 @@
+QUESTION:
+Give me top 150 members based on average monthly visits.
+
+CORRECT QUERY:
+SELECT m.memberid AS `Member id`, m.firstname AS `First Name`, m.lastname AS `Last Name`, 
+       SUM(mt.transactioncount) AS `Transaction Count`, 
+       SUM(mt.transactioncount)/COUNT(DISTINCT DATE_FORMAT(yearmonth, '%Y-%m')) AS `Average Monthly Visits`
+FROM members m
+JOIN metrics mt ON m.memberid = mt.memberid
+GROUP BY m.memberid
+ORDER BY `Average Monthly Visits` DESC
+LIMIT 150;
+
+=============
