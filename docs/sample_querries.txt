@@ -12,3 +12,27 @@ ORDER BY `Average Monthly Visits` DESC
 LIMIT 150;
 
 =============
+QUESTION:
+Give me the top member per month.
+
+CORRECT QUERY:
+SELECT 
+    m.yearmonth AS `Month-Year`,
+    mt.memberid AS `Member id`,
+    mem.firstname AS `First Name`,
+    mem.lastname AS `Last Name`,
+    m.sales AS `Total Sales`
+FROM (
+    SELECT 
+        yearmonth,
+        memberid,
+        sales,
+        RANK() OVER (PARTITION BY yearmonth ORDER BY sales DESC) AS sales_rank
+    FROM metrics
+) m
+JOIN members mem ON m.memberid = mem.memberid
+JOIN metrics mt ON m.memberid = mt.memberid AND m.yearmonth = mt.yearmonth
+WHERE m.sales_rank = 1
+GROUP BY m.yearmonth
+ORDER BY m.yearmonth
+LIMIT 20;
