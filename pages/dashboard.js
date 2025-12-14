@@ -298,6 +298,12 @@ function safeJsonParse(text) {
   }
 }
 
+function clampProgress(raw) {
+  const n = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, n));
+}
+
 // -----------------------------
 // Dashboard page
 // -----------------------------
@@ -360,6 +366,8 @@ export default function DashboardPage({ user }) {
   // Streaming management
   const streamControllerRef = useRef(null);
   const [hasStartedChat, setHasStartedChat] = useState(false);
+  const [streamingProgress, setStreamingProgress] = useState(null);
+  const [streamingProgressTarget, setStreamingProgressTarget] = useState(null);
 
   // Auto-scroll
   const messagesEndRef = useRef(null);
@@ -369,6 +377,38 @@ export default function DashboardPage({ user }) {
       messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
     }
   }, [messages]);
+
+  useEffect(() => {
+    if (typeof streamingProgressTarget !== "number") return;
+
+    const tickMs = 50;
+
+    const id = window.setInterval(() => {
+      let finished = false;
+
+      setStreamingProgress((prev) => {
+        const current = typeof prev === "number" ? prev : 0;
+        const target = streamingProgressTarget;
+
+        if (current >= target) {
+          finished = true;
+          return current;
+        }
+
+        // Incremental movement (small steps), with gentle acceleration on bigger gaps.
+        const gap = target - current;
+        const step = Math.max(0.6, gap * 0.08); // min 0.6% per tick
+        const next = Math.min(target, current + step);
+
+        if (next >= target) finished = true;
+        return next;
+      });
+
+      if (finished) window.clearInterval(id);
+    }, tickMs);
+
+    return () => window.clearInterval(id);
+  }, [streamingProgressTarget]);
 
   // Initial load + cleanup
   useEffect(() => {
@@ -593,13 +633,15 @@ export default function DashboardPage({ user }) {
       streamControllerRef.current.abort();
       streamControllerRef.current = null;
     }
+    setStreamingProgress(null);
+    setStreamingProgressTarget(null);
   }
 
   function handleSelectConversation(id) {
-    abortStreamingIfAny();
-
     setSelectedConversationId(id);
+
     setHasStartedChat(true);
+    abortStreamingIfAny();
 
     setAnswerMetaByMessageId({});
     setActiveAnswerMeta(null);
@@ -624,6 +666,8 @@ export default function DashboardPage({ user }) {
 
     setUseRag(true);
     setHasStartedChat(false);
+    setStreamingProgress(null);
+    setStreamingProgressTarget(null);
 
     setFeedbackByMessageId({});
     setCopyStatusByMessageId({});
@@ -882,6 +926,17 @@ export default function DashboardPage({ user }) {
     ]);
   }
 
+  function bumpStreamingProgressTarget(raw) {
+    const pct = clampProgress(raw);
+    if (pct == null) return;
+
+    // Don’t go backwards during a single stream.
+    setStreamingProgressTarget((prev) => {
+      const current = typeof prev === "number" ? prev : 0;
+      return pct < current ? current : pct;
+    });
+  }
+
   async function handleAsk(e) {
     e.preventDefault();
 
@@ -905,6 +960,8 @@ export default function DashboardPage({ user }) {
     setHasStartedChat(true);
 
     abortStreamingIfAny();
+    setStreamingProgress(0);
+    setStreamingProgressTarget(0);
 
     const controller = new AbortController();
     streamControllerRef.current = controller;
@@ -936,16 +993,31 @@ export default function DashboardPage({ user }) {
       const handleSseEvent = (eventName, rawData) => {
         const payload = rawData ? safeJsonParse(rawData) : null;
 
-        // 1) Status updates: render the emitted status in the streaming bubble.
-        if (eventName === "status" && payload?.message) {
-          upsertStreamingStatusMessage(payload.message);
+        // 1) Status updates from ask.js: { message, progress }
+        if (eventName === "status" && payload) {
+          if (payload.message) {
+            upsertStreamingStatusMessage(payload.message);
+          }
+          if (payload.progress != null) {
+            bumpStreamingProgressTarget(payload.progress);
+          }
           return;
         }
 
-        // 2) Final: replace temp messages with server messages and update meta.
+        // 2) Dedicated progress updates from ask.js: { progress }
+        if (eventName === "progress" && payload) {
+          if (payload.progress != null) {
+            bumpStreamingProgressTarget(payload.progress);
+          }
+          return;
+        }
+
+        // 3) Final: replace temp messages with server messages and update meta.
         if (eventName === "final" && payload) {
           shouldStop = true;
           streamControllerRef.current = null;
+          setStreamingProgress(null);
+          setStreamingProgressTarget(null);
 
           const convId = payload.conversationId || selectedConversationId;
           const serverMessages = Array.isArray(payload.messages)
@@ -978,10 +1050,12 @@ export default function DashboardPage({ user }) {
           return;
         }
 
-        // 3) Error
+        // 4) Error
         if (eventName === "error") {
           shouldStop = true;
           streamControllerRef.current = null;
+          setStreamingProgress(null);
+          setStreamingProgressTarget(null);
 
           const message =
             payload?.message || "Unable to process your request right now.";
@@ -1039,6 +1113,8 @@ export default function DashboardPage({ user }) {
         console.warn("Cancelled in-flight request.");
       } else {
         console.error("Error sending question:", err);
+        setStreamingProgress(null);
+        setStreamingProgressTarget(null);
         replaceStreamingWithError("Unable to process your request.");
       }
     } finally {
@@ -1409,7 +1485,29 @@ export default function DashboardPage({ user }) {
                               className="rounded-md border border-neutral-200 bg-white px-3 py-2 text-xs leading-relaxed text-neutral-800 cursor-pointer hover:bg-neutral-50"
                               onClick={() => handleOpenStatsForMessage(msg)}
                             >
-                              {msg.content}
+                              <div>{msg.content}</div>
+
+                              {msg.id === STREAMING_MESSAGE_ID &&
+                              typeof streamingProgress === "number" ? (
+                                <div
+                                  className="mt-2 h-1 w-full overflow-hidden rounded bg-neutral-200"
+                                  aria-label="Progress"
+                                  role="progressbar"
+                                  aria-valuenow={Math.round(streamingProgress)}
+                                  aria-valuemin={0}
+                                  aria-valuemax={100}
+                                >
+                                  <div
+                                    className="h-full bg-neutral-700 transition-[width] duration-300"
+                                    style={{
+                                      width: `${Math.max(
+                                        2,
+                                        streamingProgress
+                                      )}%`,
+                                    }}
+                                  />
+                                </div>
+                              ) : null}
                             </div>
 
                             {/* Inline BI rendering (stacked) */}
