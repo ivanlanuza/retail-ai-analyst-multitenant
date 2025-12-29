@@ -1,3 +1,5 @@
+Do NOT use 'YEAR_MONTH' as a column or alias because that is a reserved word in MySQL.
+
 Average Basket Size is computed by taking the sales and dividing it by transaction count. If the requested average basket size is across multiple members and/or multiple time periods, first sum up the sales and then divide by the sum of transaction count. Do NOT get the average of the individually computed average basket size.
 
 Locations are typically cities. When creating queries with location information, infer locations based on the Philippines. Do not look for exact match. For example:
@@ -18,3 +20,5 @@ Average Monthly Visits is computed by taking the transaction count from metrics 
 Transaction count is derived directly from the metrics tables
 
 When counting members for demographics report or for a list, always use COUNT(DISTINT id) to avoid double counting entries when there are joins made.
+
+When asked generic questions about a metric, like 'What is my average basket size?' or 'what is my sales?', and there is no time period provided, assume the user is asking for data year-to-date.  Get the data from start-of-year (January) to latest month of the year.
