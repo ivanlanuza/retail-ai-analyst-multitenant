@@ -1,112 +1,206 @@
-// pages/login.js
+import { Geist, Geist_Mono } from "next/font/google";
 import { useState } from "react";
 import { useRouter } from "next/router";
-import {
-  Card,
-  CardHeader,
-  CardTitle,
-  CardDescription,
-  CardContent,
-  CardFooter,
-} from "@/components/ui/card";
-import { Label } from "@/components/ui/label";
+import { useAuth } from "@/lib/auth/AuthContext";
+
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import Image from "next/image";
+import { Sparkles, MessageSquare, Database, ShieldCheck } from "lucide-react";
+
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
 
 export default function LoginPage() {
   const router = useRouter();
-  const [form, setForm] = useState({ email: "", password: "" });
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
 
-  function handleChange(e) {
-    setForm((prev) => ({ ...prev, [e.target.name]: e.target.value }));
-  }
+  const { login } = useAuth();
+
+  const [tenantSlug, setTenantSlug] = useState("local");
+  const [email, setEmail] = useState("ilanuza@iripple.com");
+  const [password, setPassword] = useState("happycat");
+
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(false);
 
   async function handleSubmit(e) {
     e.preventDefault();
-    setError("");
     setLoading(true);
+    setError(null);
 
     try {
       const res = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        body: JSON.stringify({
+          tenantSlug,
+          email,
+          password,
+        }),
       });
 
       const data = await res.json();
+
       if (!res.ok) {
         setError(data.error || "Login failed");
-        setLoading(false);
         return;
       }
-
-      router.push("/dashboard");
+      login(data.token);
+      router.push("/main");
     } catch (err) {
-      console.error(err);
-      setError("Unexpected error, please try again");
+      setError("Unexpected error during login");
+    } finally {
       setLoading(false);
     }
   }
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center px-4">
-      <Card className="w-full max-w-md border-neutral-200 bg-white shadow-sm">
-        <CardHeader>
-          <CardTitle className="text-xl font-semibold text-neutral-900">
-            Sign in
-          </CardTitle>
-          <CardDescription className="text-neutral-500">
-            Enter your credentials to access your dashboard.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form className="space-y-4" onSubmit={handleSubmit}>
-            <div className="space-y-1">
-              <Label htmlFor="email">Email</Label>
-              <Input
-                id="email"
-                name="email"
-                type="email"
-                placeholder="you@company.com"
-                required
-                value={form.email}
-                onChange={handleChange}
-                className="bg-neutral-50 focus-visible:ring-neutral-500"
-              />
+    <div
+      className={`${geistSans.className} ${geistMono.className} min-h-screen overflow-hidden`}
+    >
+      <div className="mx-auto flex min-h-screen  items-stretch">
+        {/* LEFT: Marketing / Explanation */}
+        <div className="relative flex w-full flex-col justify-center px-20 py-12 md:w-3/5">
+          <div className="absolute inset-0 -z-10 bg-gradient-to-br from-primary/5 via-transparent to-primary/10" />
+          <div className="pointer-events-none absolute -top-24 -left-24 h-72 w-72 rounded-full bg-red-300/20 blur-3xl" />
+          <div className="pointer-events-none absolute bottom-[-6rem] right-[-4rem] h-96 w-96 rounded-full bg-red-200/20 blur-3xl" />
+          <div className="space-y-6">
+            <h1 className="text-3xl font-extrabold tracking-tight font-sans">
+              Get instant answers from your business data
+            </h1>
+
+            <p className="text-base text-muted-foreground">
+              Ask questions about your business in plain English and get instant
+              answers from your own data — no SQL, no dashboards, no learning
+              curve.
+            </p>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="rounded-lg border bg-background p-4">
+                <div className="mb-2 inline-flex rounded-md bg-red-100 p-2 text-red-600">
+                  <MessageSquare size={18} />
+                </div>
+                <p className="font-medium">No technical skills required</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Just ask questions in plain English. No setup, no formulas, no
+                  tools to learn.
+                </p>
+              </div>
+
+              <div className="rounded-lg border bg-background p-4">
+                <div className="mb-2 inline-flex rounded-md bg-red-100 p-2 text-red-600">
+                  <Sparkles size={18} />
+                </div>
+                <p className="font-medium">Answers, not raw data</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Clear charts and short explanations that show what matters.
+                </p>
+              </div>
+
+              <div className="rounded-lg border bg-background p-4">
+                <div className="mb-2 inline-flex rounded-md bg-red-100 p-2 text-red-600">
+                  <Database size={18} />
+                </div>
+                <p className="font-medium">Built on your own data</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Insights come directly from your database and stay ptotected
+                  within your environment.
+                </p>
+              </div>
+
+              <div className="rounded-lg border bg-background p-4">
+                <div className="mb-2 inline-flex rounded-md bg-red-100 p-2 text-red-600">
+                  <ShieldCheck size={18} />
+                </div>
+                <p className="font-medium">Learns how you work</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Adapts to your questions and preferences to deliver better
+                  answers over time.
+                </p>
+              </div>
             </div>
+          </div>
+        </div>
 
-            <div className="space-y-1">
-              <Label htmlFor="password">Password</Label>
-              <Input
-                id="password"
-                name="password"
-                type="password"
-                required
-                value={form.password}
-                onChange={handleChange}
-                className="bg-neutral-50 focus-visible:ring-neutral-500"
-              />
-            </div>
+        {/* RIGHT: Login Card */}
+        <div className="relative flex w-full items-center justify-center bg-background md:w-2/5">
+          <div className="pointer-events-none absolute top-10  h-32  rounded-full bg-red-300/20 blur-2xl" />
+          <Card className="w-full max-w-md rounded-2xl border bg-background/95 p-2 shadow-2xl backdrop-blur">
+            <CardHeader>
+              <div className="rounded-lg bg-muted px-4 py-3">
+                <CardTitle className="text-center text-lg">
+                  Sign in to your account
+                </CardTitle>
+              </div>
+            </CardHeader>
 
-            {error && (
-              <p className="text-sm text-red-600 bg-red-50 border border-red-100 rounded-md px-3 py-2">
-                {error}
-              </p>
-            )}
+            <CardContent>
+              <form onSubmit={handleSubmit} className="space-y-4">
+                {error && <p className="text-sm text-destructive">{error}</p>}
 
-            <Button
-              type="submit"
-              disabled={loading}
-              className="w-full bg-neutral-900 text-neutral-50 hover:bg-neutral-800"
-            >
-              {loading ? "Signing in..." : "Sign in"}
-            </Button>
-          </form>
-        </CardContent>
-        <CardFooter className="flex justify-between text-sm text-neutral-500"></CardFooter>
-      </Card>
+                <div className="space-y-1">
+                  <Label>Account Name</Label>
+                  <Input
+                    value={tenantSlug}
+                    onChange={(e) =>
+                      setTenantSlug(e.target.value.toLowerCase())
+                    }
+                    placeholder="your-company"
+                    required
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <Label>User Email</Label>
+                  <Input
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    required
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <Label>User Password</Label>
+                  <Input
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    required
+                  />
+                </div>
+
+                <Button className="w-full" disabled={loading}>
+                  {loading ? "Signing in…" : "Login"}
+                </Button>
+
+                <p className="text-center text-xs text-muted-foreground">
+                  By signing in, you are accessing your organization’s private
+                  analytics workspace.
+                </p>
+                <div className="mt-6 rounded-xl border-l-4 border-red-400 bg-red-50/60 px-4 py-3">
+                  <p className="text-sm italic text-muted-foreground">
+                    “Think of it as talking to your database the same way you
+                    talk to an analyst.”
+                  </p>
+                  <p className="mt-1 text-right text-xs font-medium text-muted-foreground">
+                    — Copernicus
+                  </p>
+                </div>
+              </form>
+            </CardContent>
+          </Card>
+        </div>
+      </div>
     </div>
   );
 }

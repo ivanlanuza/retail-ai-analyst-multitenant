@@ -1,13 +1,12 @@
-// pages/api/chat/messages.js
-import { getDb } from "../../../lib/db.mjs";
-import { getUserFromRequest } from "../../../lib/auth";
+import { requireAuth } from "@/lib/auth/requireAuth";
+import { coreQuery } from "@/lib/db/coreDb";
 
-export default async function handler(req, res) {
+export default requireAuth(async function handler(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const user = await getUserFromRequest(req);
+  const user = req.user;
   if (!user) {
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -18,19 +17,17 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "conversationId is required" });
   }
 
-  const db = getDb();
-
   try {
     // Ensure conversation belongs to user
-    const [convRows] = await db.query(
+    const convRows = await coreQuery(
       "SELECT id FROM conversations WHERE id = ? AND user_id = ?",
-      [conversationId, user.id]
+      [conversationId, user.userId]
     );
     if (convRows.length === 0) {
       return res.status(404).json({ error: "Conversation not found" });
     }
 
-    const [messages] = await db.query(
+    const messages = await coreQuery(
       "SELECT id, role, content, answer_payload, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC",
       [conversationId]
     );
@@ -40,4 +37,4 @@ export default async function handler(req, res) {
     console.error("Error in /api/chat/messages:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
-}
+});

@@ -1,9 +1,9 @@
 // pages/api/chat/conversations.js
-import { getDb } from "../../../lib/db.mjs";
-import { getUserFromRequest } from "../../../lib/auth";
+import { requireAuth } from "@/lib/auth/requireAuth";
+import { coreQuery } from "@/lib/db/coreDb";
 
-export default async function handler(req, res) {
-  const user = await getUserFromRequest(req);
+export default requireAuth(async function handler(req, res) {
+  const user = req.user;
   if (!user) {
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -13,12 +13,11 @@ export default async function handler(req, res) {
   }
 
   return res.status(405).json({ error: "Method not allowed" });
-}
+});
 
 async function getConversations(req, res, user) {
-  const db = getDb();
   try {
-    const [rows] = await db.query(
+    const rows = await coreQuery(
       `
       SELECT
         c.id,
@@ -35,9 +34,10 @@ async function getConversations(req, res, user) {
         ) AS last_message
       FROM conversations c
       WHERE c.user_id = ?
+      AND c.tenant_id = ?
       ORDER BY c.updated_at DESC, c.id DESC
       `,
-      [user.id]
+      [user.userId, user.tenantId]
     );
 
     return res.status(200).json({ conversations: rows });
