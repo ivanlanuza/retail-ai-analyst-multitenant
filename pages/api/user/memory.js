@@ -1,10 +1,10 @@
 // pages/api/user/memory.js
-import { getUserFromRequest } from "../../../lib/auth";
-import { query } from "../../../lib/db.mjs"; // or "../lib/db" depending on your setup
+import { requireAuth } from "@/lib/auth/requireAuth";
+import { coreQuery } from "@/lib/db/coreDb";
 
-export default async function handler(req, res) {
+export default requireAuth(async function handler(req, res) {
   try {
-    const user = await getUserFromRequest(req);
+    const user = req.user;
 
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
@@ -12,14 +12,15 @@ export default async function handler(req, res) {
 
     if (req.method === "GET") {
       // Fetch existing memory_summary for this user (if any)
-      const rows = await query(
+      const rows = await coreQuery(
         `
         SELECT memory_summary
         FROM user_long_term_memory
         WHERE user_id = ?
+        AND tenant_id = ?
         LIMIT 1
       `,
-        [user.id]
+        [user.userId, user.tenantId]
       );
 
       const memorySummary =
@@ -42,23 +43,23 @@ export default async function handler(req, res) {
       const trimmedSummary = memorySummary.trim();
 
       // Try to update an existing record first
-      const result = await query(
+      const result = await coreQuery(
         `
         UPDATE user_long_term_memory
         SET memory_summary = ?, updated_at = NOW()
         WHERE user_id = ?
       `,
-        [trimmedSummary, user.id]
+        [trimmedSummary, user.userId]
       );
 
       // If no rows were updated, insert a new one
       if (!result || !result.affectedRows) {
-        await query(
+        await coreQuery(
           `
-          INSERT INTO user_long_term_memory (user_id, memory_summary)
-          VALUES (?, ?)
+          INSERT INTO user_long_term_memory (tenant_id, user_id, memory_summary)
+          VALUES (?, ?, ?)
         `,
-          [user.id, trimmedSummary]
+          [user.tenantId, user.userId, trimmedSummary]
         );
       }
 
@@ -72,4 +73,4 @@ export default async function handler(req, res) {
     console.error("Error in /api/user/memory:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
-}
+});

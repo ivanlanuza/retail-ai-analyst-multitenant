@@ -1,22 +1,22 @@
 // pages/api/chat/usage.js
-import { getUserFromRequest } from "../../../lib/auth";
-import { query } from "../../../lib/db.mjs";
+import { requireAuth } from "@/lib/auth/requireAuth";
+import { coreQuery } from "@/lib/db/coreDb";
 
-export default async function handler(req, res) {
+export default requireAuth(async function handler(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
-    const user = await getUserFromRequest(req);
+    const user = req.user;
     if (!user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const userId = user.id;
+    const userId = user.userId;
 
     // Lifetime / month / week totals (by total_tokens)
-    const [summary] = await query(
+    const [summary] = await coreQuery(
       `
       SELECT
         COALESCE(SUM(total_tokens), 0) AS lifetime_total,
@@ -43,23 +43,25 @@ export default async function handler(req, res) {
         ) AS week_total
       FROM token_usage
       WHERE user_id = ?
+      AND tenant_id = ?
     `,
-      [userId]
+      [userId, user.tenantId]
     );
 
     // Daily totals for last 30 days
-    const dailyRows = await query(
+    const dailyRows = await coreQuery(
       `
       SELECT
         DATE(created_at) AS day,
         COALESCE(SUM(total_tokens), 0) AS total_tokens
       FROM token_usage
       WHERE user_id = ?
+      AND tenant_id = ?
         AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
       GROUP BY DATE(created_at)
       ORDER BY DATE(created_at) ASC
     `,
-      [userId]
+      [userId, user.tenantId]
     );
 
     const daily = dailyRows.map((row) => {
@@ -69,8 +71,6 @@ export default async function handler(req, res) {
         totalTokens: Number(row.total_tokens) || 0,
       };
     });
-
-    //console.log("Usage summary for user", userId, ":", { summary, daily });
 
     return res.status(200).json({
       lifetimeTotalTokens: summary?.lifetime_total || 0,
@@ -84,4 +84,4 @@ export default async function handler(req, res) {
       .status(500)
       .json({ error: "Failed to load usage stats", details: String(err) });
   }
-}
+});

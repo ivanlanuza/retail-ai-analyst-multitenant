@@ -11,6 +11,7 @@ import "dotenv/config";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 import { query } from "../lib/db.mjs";
+import { contentToString } from "@/lib/chat/contentToString";
 
 const MODEL_NAME = "gpt-4o-mini";
 
@@ -20,22 +21,6 @@ const llm = new ChatOpenAI({
   model: MODEL_NAME,
   temperature: 0,
 });
-
-/**
- * Safely convert ChatOpenAI message content to a string
- */
-function contentToString(content) {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => (typeof part === "string" ? part : part.text || ""))
-      .join("");
-  }
-  if (typeof content === "object" && content !== null && "text" in content) {
-    return content.text;
-  }
-  return String(content ?? "");
-}
 
 // --------- DATA FETCH HELPERS ---------
 
