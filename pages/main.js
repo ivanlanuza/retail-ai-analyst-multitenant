@@ -434,7 +434,7 @@ function MainPage() {
   const [messages, setMessages] = useState([]);
 
   // Input
-  const [question, setQuestion] = useState("What is my sales month on month?");
+  const [question, setQuestion] = useState("What is my average basket size?");
 
   // Loading states
   const [loadingConversations, setLoadingConversations] = useState(false);

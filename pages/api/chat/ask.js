@@ -2,8 +2,6 @@
 // Streaming (SSE) chat endpoint: classifies request, optionally retrieves context (RAG/memory),
 // generates SQL, runs it, summarizes results, and returns a stable `answerPayload` for the UI.
 
-import { ChatOpenAI } from "@langchain/openai";
-
 import { requireAuth } from "@/lib/auth/requireAuth";
 import { createSse } from "@/lib/http/sse";
 import { requirePost } from "@/lib/http/guards";
@@ -32,11 +30,14 @@ import { buildRagMeta } from "@/lib/chat/buildAnswer";
 import { buildAnswerPayload } from "@/lib/chat/buildAnswer";
 import { persistAssistantMessage } from "@/lib/chat/buildAnswer";
 import { updateMessageSummary } from "@/lib/chat/buildAnswer";
+import { emptyUsage } from "@/lib/chat/usageLogger";
+import { addUsage } from "@/lib/chat/usageLogger";
+import { applySummaryUsageUpdate } from "@/lib/chat/usageLogger";
 
-const MODEL_NAME = "gpt-4.1-mini";
-const llm = new ChatOpenAI({ model: MODEL_NAME, temperature: 0 });
-const MAX_TABLE_ROWS_IN_RESPONSE = 20; // must match prompt rule unless user asks otherwise
-const CSV_EXPORT_ROW_THRESHOLD = 21; // when >= this, include csv export payload
+import { MODEL_NAME } from "@/lib/settings";
+import { llm } from "@/lib/settings";
+import { MAX_TABLE_ROWS_IN_RESPONSE } from "@/lib/settings";
+import { CSV_EXPORT_ROW_THRESHOLD } from "@/lib/settings";
 
 export default requireAuth(async function handler(req, res) {
   // ----------------------------------------------------
@@ -80,11 +81,15 @@ export default requireAuth(async function handler(req, res) {
     emitStatus("Understanding your question…", 8);
 
     // Quick classification: data vs non-data
-    const isDataRequest = await classifyDataRequest({
-      question,
-      emitStatus,
-      llm,
-    });
+    const { isDataRequest, usage: classificationUsage } =
+      await classifyDataRequest({
+        question,
+        emitStatus,
+        llm,
+      });
+
+    // Initialize total usage with classification usage
+    let totalUsage = addUsage(emptyUsage(), classificationUsage);
 
     // ----------------------------------------------------
     // 3) Handle Non-Data Requests
@@ -100,6 +105,7 @@ export default requireAuth(async function handler(req, res) {
         closeWith,
         llm,
         MODEL_NAME,
+        classificationUsage,
       });
       return;
     }
@@ -162,6 +168,9 @@ export default requireAuth(async function handler(req, res) {
       maxRows: MAX_TABLE_ROWS_IN_RESPONSE,
     });
 
+    //Accumulate token usage
+    totalUsage = addUsage(totalUsage, sqlUsage);
+
     emitStatus("Running query on database…", 65);
 
     //Run actual SQL against tenant data database
@@ -196,7 +205,7 @@ export default requireAuth(async function handler(req, res) {
     emitStatus("Summarizing results…", 80);
 
     //Get concise answer text from results
-    const { answerText, usage } = await getAnswerText({
+    const { answerText, usage: answerUsage } = await getAnswerText({
       llm,
       question,
       sql,
@@ -204,20 +213,8 @@ export default requireAuth(async function handler(req, res) {
       rows,
     });
 
-    //Log telemetry (query_logs + query_sources)
-    const queryLogId = await logAnswerTelemetry({
-      tenantId: user.tenantId,
-      userId: user.userId,
-      conversationId: convId,
-      question,
-      answerText,
-      sql,
-      usage,
-      durationMs,
-      modelName: MODEL_NAME,
-      useRagBool,
-      retrievedDocs,
-    });
+    //Accumulate token usage
+    totalUsage = addUsage(totalUsage, answerUsage);
 
     //Build table + optional CSV download
     const { table, downloads } = buildTable({
@@ -229,12 +226,15 @@ export default requireAuth(async function handler(req, res) {
     });
 
     //Build Optional chart payload
-    const chart = await buildAreaChart({
+    const { chart, usage: chartUsage } = await buildAreaChart({
       question,
       fields,
       rows,
       llm,
     });
+
+    //Accumulate token usage
+    totalUsage = addUsage(totalUsage, chartUsage);
 
     //Build RAG metadata
     const ragMeta = buildRagMeta({
@@ -244,11 +244,11 @@ export default requireAuth(async function handler(req, res) {
     });
 
     //Build answerPayload (UI contract)
-    const answerPayload = buildAnswerPayload({
+    let answerPayload = buildAnswerPayload({
       answerText,
       sql,
       sqlQueryId,
-      usage,
+      usage: totalUsage,
       modelName: MODEL_NAME,
       table,
       downloads,
@@ -263,23 +263,62 @@ export default requireAuth(async function handler(req, res) {
     // ---------------------------------------------------
 
     // Persist assistant message & TokenUsage
-    const persistenceId = await persistAssistantMessage({
+    const { messageId, tokenUsageId } = await persistAssistantMessage({
       tenantId: user.tenantId,
       userId: user.userId,
       conversationId: convId,
       answerText,
       answerPayload,
       modelName: MODEL_NAME,
-      usage,
+      usage: totalUsage,
     });
-    console.log("Persisted assistant message with ID:", persistenceId);
+    console.log("Persisted assistant message with ID:", messageId);
 
     //Update conversation summary if needed
-    const messages = await updateMessageSummary({
+    const { messages, usage: summaryUsage } = await updateMessageSummary({
       convId,
       conversationSummaryForPrompt,
       user,
       llm,
+    });
+
+    //Accumulate token usage
+    totalUsage = addUsage(totalUsage, summaryUsage);
+
+    //Apply summary usage update to answerPayload if applicable
+    const summaryUpdate = await applySummaryUsageUpdate({
+      summaryUsage,
+      totalUsage,
+      answerText,
+      sql,
+      sqlQueryId,
+      modelName: MODEL_NAME,
+      table,
+      downloads,
+      chart,
+      ragMeta,
+      messageId,
+      tenantId: user.tenantId,
+      tokenUsageId,
+      messages,
+    });
+    if (summaryUpdate.answerPayload) {
+      answerPayload = summaryUpdate.answerPayload;
+    }
+
+    //Log telemetry (query_logs + query_sources)
+    await logAnswerTelemetry({
+      tenantId: user.tenantId,
+      userId: user.userId,
+      conversationId: convId,
+      question,
+      answerText,
+      sql,
+      usage: totalUsage,
+      durationMs,
+      modelName: MODEL_NAME,
+      useRagBool,
+      retrievedDocs,
     });
 
     //Send final SSE response

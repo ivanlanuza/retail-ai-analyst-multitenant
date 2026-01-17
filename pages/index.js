@@ -136,8 +136,8 @@ export default function LoginPage() {
           <div className="pointer-events-none absolute top-10  h-32  rounded-full bg-red-300/20 blur-2xl" />
           <Card className="w-full max-w-md rounded-2xl border bg-background/95 p-2 shadow-2xl backdrop-blur">
             <CardHeader>
-              <div className="rounded-t-lg px-4 py-4 -mt-8 -mx-8 border-b bg-red-200">
-                <CardTitle className="text-center text-md">
+              <div className="rounded-t-lg px-4 py-4 -mt-8 -mx-8 border-b bg-slate-200">
+                <CardTitle className="text-left text-md ml-4">
                   Sign in to your account
                 </CardTitle>
               </div>
@@ -187,14 +187,12 @@ export default function LoginPage() {
                   {/*By signing in, you are accessing your organization’s private
                   analytics workspace.*/}
                 </p>
-                <div className="mt-12 rounded-xl border-l-4 border-red-400 bg-red-50/60 px-4 py-3">
+                <div className="mt-18 rounded-xl border-l-4 border-red-400 bg-red-50/60 px-4 py-3">
                   <p className="text-sm italic text-muted-foreground">
                     “Think of it as talking to your database the same way you
                     talk to an analyst.”
                   </p>
-                  <p className="mt-1 text-right text-xs font-medium text-muted-foreground">
-                    — Natalie Portman
-                  </p>
+                  <p className="mt-1 text-right text-xs font-medium text-muted-foreground"></p>
                 </div>
               </form>
             </CardContent>
