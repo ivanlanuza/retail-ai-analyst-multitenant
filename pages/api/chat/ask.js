@@ -166,6 +166,7 @@ export default requireAuth(async function handler(req, res) {
       schemaText,
       context: ragContext,
       maxRows: MAX_TABLE_ROWS_IN_RESPONSE,
+      dbType: tenant.data_db_type,
     });
 
     //Accumulate token usage

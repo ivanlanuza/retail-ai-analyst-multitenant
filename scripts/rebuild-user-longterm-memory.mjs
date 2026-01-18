@@ -1,19 +1,53 @@
-// scripts/rebuildUserLongTermMemory.mjs
-//
+// scripts/rebuild-user-longterm-memory.mjs
 // Periodic job to rebuild user_long_term_memory from query_logs + conversations.
-//
-// Usage:
-//   node scripts/rebuildUserLongTermMemory.mjs
-//
-// You can wire this into cron / GitHub Actions / PM2, etc.
+// To run, go to terminal and run directly: node scripts/rebuild-user-longterm-memory.mjs
 
 import "dotenv/config";
+import mysql from "mysql2/promise";
 import { ChatOpenAI } from "@langchain/openai";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
-import { query } from "../lib/db.mjs";
-import { contentToString } from "@/lib/chat/contentToString";
 
-const MODEL_NAME = "gpt-4o-mini";
+const MODEL_NAME = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+function contentToString(content) {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => contentToString(part))
+      .join(" ")
+      .trim();
+  }
+  if (typeof content === "object") {
+    if (typeof content.text === "string") return content.text;
+    try {
+      return JSON.stringify(content);
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+let pool;
+function getCoreDb() {
+  if (!pool) {
+    pool = mysql.createPool({
+      host: process.env.CORE_DB_HOST,
+      user: process.env.CORE_DB_USER,
+      password: process.env.CORE_DB_PASSWORD,
+      database: process.env.CORE_DB_NAME,
+      waitForConnections: true,
+      connectionLimit: 10,
+    });
+  }
+  return pool;
+}
+
+async function coreQuery(sql, params = []) {
+  const [rows] = await getCoreDb().execute(sql, params);
+  return rows;
+}
 
 // --------- LLM SETUP ---------
 
@@ -26,41 +60,46 @@ const llm = new ChatOpenAI({
 
 /**
  * Get list of user_ids that have activity (query_logs or conversations)
- * in the last X days.
+ * in the last X days.  Regardless of tenancy.
  */
 async function getActiveUserIds({ days = 90 } = {}) {
-  const rows = await query(
+  const rows = await coreQuery(
     `
-    SELECT DISTINCT u.id AS user_id
-    FROM users u
-    LEFT JOIN query_logs q ON q.user_id = u.id
-    LEFT JOIN conversations c ON c.user_id = u.id
-    WHERE
-      (q.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-       OR c.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY))
-      AND (q.id IS NOT NULL OR c.id IS NOT NULL)
+  SELECT DISTINCT user_id, tenant_id
+  FROM (
+    SELECT q.user_id, q.tenant_id
+    FROM query_logs q
+    WHERE q.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+
+    UNION
+
+    SELECT c.user_id, c.tenant_id
+    FROM conversations c
+    WHERE c.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+  ) active_users
   `,
     [days, days]
   );
 
-  return rows.map((r) => r.user_id);
+  return rows.map((r) => ({ userId: r.user_id, tenantId: r.tenant_id }));
 }
 
 /**
  * Fetch recent query logs for a user.
  * These give us questions + short answers.
  */
-async function getUserRecentQueryLogs(userId, { limit = 50 } = {}) {
+async function getUserRecentQueryLogs(userId, tenantId, { limit = 50 } = {}) {
   const safeLimit = Number.isFinite(Number(limit)) ? Number(limit) : 50;
-  const rows = await query(
+  const rows = await coreQuery(
     `
     SELECT id, question, answer_summary, sql_query, created_at
     FROM query_logs
     WHERE user_id = ?
+      AND tenant_id = ?
     ORDER BY created_at DESC
     LIMIT ${safeLimit}
   `,
-    [userId]
+    [userId, tenantId]
   );
   return rows;
 }
@@ -68,19 +107,24 @@ async function getUserRecentQueryLogs(userId, { limit = 50 } = {}) {
 /**
  * Fetch conversation summaries for a user.
  */
-async function getUserConversationSummaries(userId, { limit = 20 } = {}) {
+async function getUserConversationSummaries(
+  userId,
+  tenantId,
+  { limit = 20 } = {}
+) {
   const safeLimit = Number.isFinite(Number(limit)) ? Number(limit) : 20;
-  const rows = await query(
+  const rows = await coreQuery(
     `
     SELECT id, title, conversation_summary, updated_at
     FROM conversations
     WHERE user_id = ?
+      AND tenant_id = ?
       AND conversation_summary IS NOT NULL
       AND conversation_summary != ''
     ORDER BY updated_at DESC, id DESC
     LIMIT ${safeLimit}
   `,
-    [userId]
+    [userId, tenantId]
   );
   return rows;
 }
@@ -136,10 +180,10 @@ function formatConversationSummariesForPrompt(conversations) {
 
 // --------- MEMORY BUILDING VIA LLM ---------
 
-async function buildUserMemorySummary(userId) {
+async function buildUserMemorySummary(userId, tenantId) {
   const [logs, convs] = await Promise.all([
-    getUserRecentQueryLogs(userId),
-    getUserConversationSummaries(userId),
+    getUserRecentQueryLogs(userId, tenantId),
+    getUserConversationSummaries(userId, tenantId),
   ]);
 
   if ((!logs || logs.length === 0) && (!convs || convs.length === 0)) {
@@ -207,25 +251,26 @@ async function buildUserMemorySummary(userId) {
 
 // --------- DB WRITE ---------
 
-async function insertUserMemorySummary(userId, memorySummary) {
+async function insertUserMemorySummary(userId, tenantId, memorySummary) {
   // First try to update an existing record for this user
-  const result = await query(
+  const result = await coreQuery(
     `
     UPDATE user_long_term_memory
     SET memory_summary = ?, updated_at = NOW()
     WHERE user_id = ?
+      AND tenant_id = ?
   `,
-    [memorySummary, userId]
+    [memorySummary, userId, tenantId]
   );
 
   // If no rows were updated, insert a new record
   if (!result || !result.affectedRows) {
-    await query(
+    await coreQuery(
       `
-      INSERT INTO user_long_term_memory (user_id, memory_summary)
-      VALUES (?, ?)
+      INSERT INTO user_long_term_memory (user_id, tenant_id, memory_summary)
+      VALUES (?, ?, ?)
     `,
-      [userId, memorySummary]
+      [userId, tenantId, memorySummary]
     );
   }
 }
@@ -235,27 +280,34 @@ async function insertUserMemorySummary(userId, memorySummary) {
 async function rebuildAllUserMemories() {
   console.log("Starting user_long_term_memory rebuild job...");
 
-  const userIds = await getActiveUserIds({ days: 90 });
-  console.log(`Found ${userIds.length} active users in last 90 days.`);
+  const users = await getActiveUserIds({ days: 90 });
+  console.log(`Found ${users.length} active users in last 90 days.`);
 
   let updatedCount = 0;
   let skippedCount = 0;
 
-  for (const userId of userIds) {
+  for (const { userId, tenantId } of users) {
     try {
-      console.log(`\n=== Building memory for user ${userId} ===`);
-      const summary = await buildUserMemorySummary(userId);
+      console.log(
+        `\n=== Building memory for user ${userId} (tenant ${tenantId}) ===`
+      );
+      const summary = await buildUserMemorySummary(userId, tenantId);
 
       if (!summary) {
         skippedCount += 1;
         continue;
       }
 
-      await insertUserMemorySummary(userId, summary);
+      await insertUserMemorySummary(userId, tenantId, summary);
       updatedCount += 1;
-      console.log(`User ${userId}: memory summary inserted.`);
+      console.log(
+        `User ${userId} (tenant ${tenantId}): memory summary inserted.`
+      );
     } catch (err) {
-      console.error(`User ${userId}: error while rebuilding memory:`, err);
+      console.error(
+        `User ${userId} (tenant ${tenantId}): error while rebuilding memory:`,
+        err
+      );
     }
   }
 
